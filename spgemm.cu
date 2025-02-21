@@ -23,10 +23,6 @@ Author: Petrus E. Manurung
 #include <cooperative_groups/memcpy_async.h>
 #include <cooperative_groups/reduce.h>
 
-#include <cuda/barrier> // for shape
-#include <cuda/semaphore>
-#include <cuda/pipeline>
-
 #include <thrust/sort.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/iterator/constant_iterator.h>
@@ -570,77 +566,92 @@ int __multiply_default2(
     // int my_nnz = 0;
 
     // branch to use sparse or dense acc 
-    if(nnz >= 192 /*or 192?*/) [[unlikely]] //dense acc->50% // dense acc -> 75%
-    {   
-        // expand vals[] in place for  A and B
-        // use earlier thread_mask
-        #pragma unroll
-        for(int r = tileSize - 1; r >=0; --r){
-            unsigned current_mask = local_group.shfl(thread_mask, r);
-            if( (current_mask ^ 0xFFFFU) == 0 ) {
-                if(tiles[lgmgr].rowPtr[r] != r * 16) {
-                    ValueType my_elem = tiles[lgmgr].vals[tiles[lgmgr].rowPtr[r] + lgtr];
-                    tiles[lgmgr].vals[r * 16 + lgtr] = my_elem;
-                }
-                continue;
-            }
+    // if(nnz >= 192 /*or 192?*/) [[unlikely]] //dense acc->50% // dense acc -> 75%
+    // {   
+    //     // expand vals[] in place for  A and B
+    //     // use earlier thread_mask
+    //     #pragma unroll
+    //     for(int r = tileSize - 1; r >=0; --r){
+    //         int local_group_row_len = ((r == tileSize - 1) ? (lgmgr == 0 ? tileA_shmem_nnz : tileB_shmem_nnz) : tiles[lgmgr].rowPtr[r + 1])
+    //                                                                                                           - tiles[lgmgr].rowPtr[r];
+    //         if(local_group_row_len == 0) {
+    //             tiles[lgmgr].vals[r * 16 + lgtr] = 0;
+    //             continue;
+    //         }
 
-            ValueType my_elem = 0;
-            int local_group_row_len = ((r == tileSize - 1) ? (lgmgr == 0 ? tileA_shmem_nnz : tileB_shmem_nnz) : tiles[lgmgr].rowPtr[r + 1])
-                                                                                                                        - tiles[lgmgr].rowPtr[r];
+    //         unsigned current_mask = local_group.shfl(thread_mask, r);                                                                                                          
+    //         if(tiles[lgmgr].rowPtr[r] != r * 16) {
+    //             // ValueType my_elem = tiles[lgmgr].vals[tiles[lgmgr].rowPtr[r] + lgtr];
+    //             // if(lgtr >= local_group_row_len) my_elem = 0;}
+    //             // tiles[lgmgr].vals[r * 16 + lgtr] = my_elem;
+
+    //             ValueType my_elem {};
+    //             local_group.sync();
+    //             if( ((current_mask >> lgtr) & 1) == 1) {
+    //                 auto coalesced = cg::coalesced_threads();
+    //                 my_elem = tiles[lgmgr].vals[tiles[lgmgr].rowPtr[r] + coalesced.thread_rank()];
+    //             }
+    //             tiles[lgmgr].vals[r * 16 + lgtr] = my_elem;
+    //         }
+
+    //         ValueType my_elem = 0;
             
-            if(lgtr < local_group_row_len){
-                my_elem = tiles[lgmgr].vals[tiles[lgmgr].rowPtr[r] + lgtr];
-                int my_dst = tiles[lgmgr].rowColIdx[tiles[lgmgr].rowPtr[r] + lgtr] & 0x0FU;
-                tiles[lgmgr].vals[r * tileSize + my_dst] = my_elem;
-            }
-            local_group.sync();
+    //         if(lgtr < local_group_row_len){
+    //             my_elem = tiles[lgmgr].vals[tiles[lgmgr].rowPtr[r] + lgtr];
+    //             int my_dst = tiles[lgmgr].rowColIdx[tiles[lgmgr].rowPtr[r] + lgtr] & 0x0FU;
+    //             tiles[lgmgr].vals[r * tileSize + my_dst] = my_elem;
+    //         }
+    //         local_group.sync();
             
-            if(lgtr < tileSize - local_group_row_len){
-                int element_to_be_zeroed = __fns(~(current_mask), 0, lgtr + 1);
-                tiles[lgmgr].vals[r * tileSize + element_to_be_zeroed] = 0;
-            }
-            local_group.sync();
-        }
-        warp.sync();
-        __tile16x16_transpose_sync(warp, tiles[1].vals); // transpose B
+    //         if(lgtr < tileSize - local_group_row_len){
+    //             int element_to_be_zeroed = __fns(~(current_mask), 0, lgtr + 1);
+    //             tiles[lgmgr].vals[r * tileSize + element_to_be_zeroed] = 0;
+    //         }
+    //         local_group.sync();
+    //     }
+    //     warp.sync();
+    //     __tile16x16_transpose_sync(warp, tiles[1].vals); // transpose B
 
-        ValueType my_sum {};
-        #pragma unroll
-        for(int r = 0; r < tileSize; ++r) {
-            ValueType curr = tiles[lgmgr].vals[r * tileSize + lgtr];
-            #pragma unroll
-            for(int c = 1; c < tileSize; ++c) {
-                ValueType temp = curr * warp.shfl_down(curr, 16);
-                temp = cg::reduce(local_group, temp, cg::plus<ValueType>());
+    //     auto fma_buf = reinterpret_cast<ValueType*>(myWarp_buffer);
+    //     ValueType my_sum {};
+    //     #pragma unroll
+    //     for(int r = 0; r < tileSize; ++r) {
+    //         ValueType curr = tiles[lgmgr].vals[r * tileSize + lgtr];
+    //         fma_buf[warp.thread_rank()] = curr;
+    //         #pragma unroll
+    //         for(int c = 0; c < tileSize; ++c) {
+    //             ValueType temp {};
+    //             for(int n = 0; n < 16; ++n)
+    //             temp += fma_buf[n] * fma_buf[n + 16];
 
-                if(lgmgr == 1)
-                curr = tiles[lgmgr].vals[c * tileSize + lgtr];
+    //             if(lgmgr == 1)
+    //             curr = tiles[lgmgr].vals[c * tileSize + lgtr];
 
-                if(lgtr == c - 1) my_sum = temp;
-                warp.sync();
-            }
+    //             if(lgtr == c - 1) my_sum = temp;
+    //             warp.sync();
+    //         }
 
-            // last batch
-            ValueType temp = curr * warp.shfl_down(curr, 16);
-            temp = cg::reduce(local_group, temp, cg::plus<ValueType>());
-            if(lgtr == 15) my_sum = temp;
-            warp.sync();
+    //         // last batch
+    //         ValueType temp {};
+    //         for(int n = 0; n < 16; ++n)
+    //         temp += fma_buf[n] * fma_buf[n + 16];
+    //         if(lgtr == 15) my_sum = temp;
+    //         warp.sync();
 
-            // store
-            if(lgmgr == 0) {
-                if(my_sum != 0) 
-                {
-                    atomicAdd(&tileC->vals[r * tileSize + lgtr], my_sum);
-                    // ++my_nnz;
-                }
-                if(lgtr == r) tileC->mask[r] = C_mask;
-            }
-            warp.sync();
-        }
-    }
-    else [[likely]]  // sparse acc
-    {
+    //         // store
+    //         if(lgmgr == 0) {
+    //             if(my_sum != 0) 
+    //             {
+    //                 atomicAdd(&tileC->vals[r * tileSize + lgtr], my_sum);
+    //                 // ++my_nnz;
+    //             }
+    //             if(lgtr == r) tileC->mask[r] = C_mask;
+    //         }
+    //         warp.sync();
+    //     }
+    // }
+    // else [[likely]]  // sparse acc
+    // {
         // we loop only for nonzero C's in mask
         #pragma unroll
         for(int r = 0; r < tileSize; ++r) {
@@ -689,21 +700,21 @@ int __multiply_default2(
                 }
                 // warp.sync();
 
-                ValueType row_sum = warp.shfl_down(my_elem, 16);
-                row_sum *= my_elem;
-                row_sum = cg::reduce(local_group, row_sum, cg::plus<ValueType>());
-                // row_sum = __fmul_rn(row_sum, my_elem);
-                // __shared__ ValueType acc;
-                // if(lgmgr == 0) {
-                //     acc = 0;
-                //     local_group.sync();
-                //     for(int t = 0; t < 16; ++t) {
-                //         if(lgtr == t) acc = __fadd_rn(acc, row_sum);
-                //     }
-                // }
+                // ValueType row_sum = warp.shfl_down(my_elem, 16);
+                // row_sum *= my_elem;
+                // row_sum = cg::reduce(local_group, row_sum, cg::plus<ValueType>());                
                 
-                if(lgmgr == 0 &&
-                    lgtr == c) my_sum = row_sum;
+                // if(lgmgr == 0 &&
+                //     lgtr == c) my_sum = row_sum;
+
+                auto fma_buf = reinterpret_cast<ValueType*>(myWarp_buffer);
+                *(fma_buf + warp.thread_rank()) = my_elem;
+                if(lgmgr == 0 && lgtr == c) {
+                    #pragma unroll
+                    for(int i = 0; i < 16; ++i) 
+                    if(fma_buf[i] !=0 && fma_buf[i+16] !=0)
+                    my_sum += fma_buf[i] * fma_buf[i + 16];
+                }
 
                 search_in_b_mask &= (~(1 << c));
             }
@@ -722,7 +733,7 @@ int __multiply_default2(
             }
             warp.sync();
         }
-    }
+    // }
     // my_nnz = cg::reduce(warp, my_nnz, cg::plus<int>());
     // return my_nnz;
     return nnz;
@@ -749,7 +760,7 @@ __device__ __forceinline__ void warp_load_tile(cg::thread_block_tile<32, cg::thr
 
 template<typename ValueType, int tileSize = 16>
 __global__ void 
-// __launch_bounds__(tileSize * tileSize)
+__launch_bounds__(tileSize * tileSize / 2)
 multiply_pairs(
     cr_Ptr<long long> d_pairs,
     int d_pairs_size,
@@ -784,22 +795,6 @@ multiply_pairs(
 
     perWarp_buffer[threadIdx.x] = 0;
 
-    // auto warp_load_tile = [](cg::thread_block_tile<32, cg::thread_block> warp, auto tile, auto warp_tiles_start) __attribute__((always_inline)) {
-    //     constexpr int use_size = sizeof(ulonglong4); // 32byte
-    //     static_assert(use_size == 32);
-    //     int total_chunk = sizeof(TileCSR<ValueType>) / use_size;
-        
-    //     // warp.sync(); // uncomment later?
-    //     int thread_start = warp.thread_rank();
-    //     while(thread_start < total_chunk) {
-    //         *(reinterpret_cast<ulonglong4*>(warp_tiles_start) + thread_start) = *(reinterpret_cast<const ulonglong4*>(tile) + thread_start);
-    //         thread_start += warp.size();
-    //     }
-    //     if(thread_start == 41) {
-    //         *(reinterpret_cast<uint4*>(warp_tiles_start) + thread_start * 2) = *(reinterpret_cast<uint4 const*>(tile) + thread_start * 2);
-    //     }
-    //     warp.sync();
-    // };
     auto warp_load_tile_lambda = [](
         auto const &half_warp, 
         auto *tile,
@@ -819,26 +814,16 @@ multiply_pairs(
     int warp_pairs_idx_start = grid.block_rank() * 4 + warp.meta_group_rank();
     TileCSR<ValueType> *warp_shmem_tile_start = reinterpret_cast<TileCSR<ValueType>*>(tiles) + warp.meta_group_rank() * 2;
     while(warp_pairs_idx_start < d_pairs_size) {
-        // int warp_Atile_idx = 0;
-        // int warp_Btile_idx = 0;
         int warp_tile_idx[2];
 
         long long warp_pairs = d_pairs[warp_pairs_idx_start];
-        // warp_Atile_idx = *(reinterpret_cast<int*>(&warp_pairs)+1);
-        // warp_Btile_idx = *(reinterpret_cast<int*>(&warp_pairs));
         warp_tile_idx[0] = *(reinterpret_cast<int*>(&warp_pairs)+1);
         warp_tile_idx[1] = *(reinterpret_cast<int*>(&warp_pairs));
 
-        // int tileA_nnz = 0, tileB_nnz = 0;
         int tile_nnz[2];
-        // tileA_nnz = _A_perTileNnz[warp_Atile_idx+1] - _A_perTileNnz[warp_Atile_idx];
-        // tileB_nnz = _B_perTileNnz[warp_Btile_idx+1] - _B_perTileNnz[warp_Btile_idx];
         tile_nnz[0] = _A_perTileNnz[warp_tile_idx[0]+1] - _A_perTileNnz[warp_tile_idx[0]];
         tile_nnz[1] = _B_perTileNnz[warp_tile_idx[1]+1] - _B_perTileNnz[warp_tile_idx[1]];
 
-        // warp_load_tile<ValueType>(warp, Atiles + warp_Atile_idx, warp_shmem_tile_start);
-        // warp_load_tile<ValueType>(warp, Btiles + warp_Btile_idx, warp_shmem_tile_start + 1);
-        // warp.sync();
         auto half_warp = cg::tiled_partition<16>(warp);
         int half_warp_mgr = half_warp.meta_group_rank();
         auto half_warp_tile = (half_warp_mgr == 0) ? Atiles : Btiles;
@@ -853,20 +838,9 @@ multiply_pairs(
         TileCSR_C<ValueType> *tileC = Ctiles + warp_tileC_idx;
 
         int tileC_nnz = __multiply_default2(warp, perWarp_buffer + tileSize * 2 * warp.meta_group_rank(), tileC, warp_shmem_tile_start, tile_nnz[0], tile_nnz[1]);
-        // int tileC_nnz = 0;
-        if(warp.thread_rank() == 0) 
-        {
-        // pairs_idx.fetch_add(1, cuda::memory_order_relaxed);
-        if(tileC_nnz > 0)
-        atomicMax(&_C_perTileNnz[warp_tileC_idx], tileC_nnz);
-        }
-        // __multiply_default2(warp, perWarp_buffer + tileSize * 2 * warp.meta_group_rank(), tileC, warp_shmem_tile_start, tileA_nnz, tileB_nnz);
-        // warp.sync();
+
         warp_pairs_idx_start += grid.num_blocks() * block.num_threads() / warp.size();
     }
-
-    // grid.sync();
-    // if(grid.thread_rank() == 0) printf("pairs_idx %d\n", pairs_idx.load(cuda::memory_order_relaxed));
 }
 
 __device__ __forceinline__
@@ -1668,7 +1642,7 @@ int main(int argc, char *argv[]) {
     kern_args[0] = static_cast<void*>(&ptr1);
     kern_args[1] = static_cast<void*>(&ptr2);
     cudaMemsetAsync(pairs_count, 0, sizeof(int), STREAM_C);
-    // blocks_sp.x = 1;
+    // blocks_sp.x = 7;
     CHECK_CUDA( cudaLaunchCooperativeKernel((void*)search_pairs<1>, blocks_sp, threads_sp, kern_args, 0, STREAM_C) )
 
 #ifdef DEBUG_9
