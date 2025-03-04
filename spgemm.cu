@@ -590,7 +590,6 @@ int __multiply_default2(
 
             int lowest_thread_with_0 = __ffs(local_group.ballot(my_elem == 0)) - 1;
             if(myWarp_buffer[lgtr] == -1) myWarp_buffer[lgtr] = lowest_thread_with_0;
-            local_group.sync();
             my_elem = local_group.shfl(my_elem, myWarp_buffer[lgtr]);
         }
 
@@ -612,21 +611,27 @@ int __multiply_default2(
             }
             // warp.sync();
 
-            // ValueType row_sum = warp.shfl_down(my_elem, 16);
-            // row_sum *= my_elem;
-            // row_sum = cg::reduce(local_group, row_sum, cg::plus<ValueType>());                
+            ValueType row_sum = warp.shfl_down(my_elem, 16);
+            row_sum *= my_elem;
+            // row_sum = cg::reduce(local_group, row_sum, cg::plus<ValueType>());
+            row_sum += local_group.shfl_down(row_sum, 8);            
+            row_sum += local_group.shfl_down(row_sum, 4);      
+            row_sum += local_group.shfl_down(row_sum, 2);      
+            row_sum += local_group.shfl_down(row_sum, 1);      
+            row_sum = warp.shfl(row_sum, 0);    
             
-            // if(lgmgr == 0 &&
-            //     lgtr == c) my_sum = row_sum;
+            if(lgmgr == 0 &&
+                lgtr == c) my_sum = row_sum;
             
-            auto fma_buf = reinterpret_cast<ValueType*>(myWarp_buffer);
-            *(fma_buf + warp.thread_rank()) = my_elem;
-            if(lgmgr == 0 && lgtr == c) {
-                #pragma unroll
-                for(int i = 0; i < 16; ++i) 
-                if(fma_buf[i] !=0 && fma_buf[i+16] !=0)
-                my_sum += fma_buf[i] * fma_buf[i + 16];
-            }
+            // auto fma_buf = reinterpret_cast<ValueType*>(myWarp_buffer);
+            // *(fma_buf + warp.thread_rank()) = my_elem;
+            // if(lgmgr == 0 && lgtr == c) {
+            //     #pragma unroll
+            //     for(int i = 0; i < 16; ++i) 
+            //     // if(fma_buf[i] !=0 && fma_buf[i+16] !=0)
+            //     my_sum += fma_buf[i] * fma_buf[i + 16];
+            //     // atomicAdd((float*)&tileC->vals[r*tileSize+lgtr], fma_buf[i] * fma_buf[i * 16]);
+            // }
 
             search_in_b_mask &= (~(1 << c));
         }
@@ -1722,8 +1727,8 @@ int main(int argc, char *argv[]) {
         }
     );
 
-    // std::quick_exit(0);
-    std::atexit([]{cudaDeviceReset();});
+    std::quick_exit(0);
+    // std::atexit([]{cudaDeviceReset();});
     return 0; // <--------------------------------------------------------------------------------------------------------------------------------
 
     rmm::device_vector<int> Crows(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
