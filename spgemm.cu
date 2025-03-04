@@ -645,13 +645,24 @@ int __multiply_default2(
                 atomicAdd(&tileC->vals[r * tileSize + lgtr], my_sum);
                 // ++my_nnz;
             }
-            if(lgtr == r) tileC->mask[r] = C_mask;
+            // if(lgtr == r) tileC->mask[r] |= C_mask;
+            // tileC->mask[lgtr] |= C_mask;
             // if(lgtr == 0) atomicMax(&_C_perTileNnz[warp_tileC_idx], tileC_nnz);
         }
         warp.sync();
     }
     // my_nnz = cg::reduce(warp, my_nnz, cg::plus<int>());
     // return my_nnz;
+    if(lgmgr == 0) {
+        if(lgtr % 2 == 0) C_mask <<= 16;
+        C_mask |= local_group.shfl_xor(C_mask, 0x1U);
+        if(lgtr % 2 == 0)
+        {
+            auto coalesced = cg::coalesced_threads();
+            atomicOr((unsigned*)&tileC->mask[coalesced.thread_rank()*2], C_mask);
+        }
+    }
+    warp.sync();
     return nnz;
 }
 
@@ -851,11 +862,12 @@ sanitize_C(
 template<typename ValueType>
 __global__ void count_pertile_nnz(r_Ptr<int> C_perTileNnz, cr_Ptr<TileCSR_C<ValueType>> Ctiles)
 {
-    int Ctiles_id = cg::this_grid().thread_rank();
+    int Ctiles_id = cg::this_grid().block_rank();
     int count = 0;
-    for(int i = 0; i < 256; ++i) {
-        // count += __popc(Ctiles[Ctiles_id].mask[i]);
-        if(Ctiles[Ctiles_id].vals[i] != 0) ++count;
+    for(int i = 0; i < 16; ++i) {
+        unsigned m = Ctiles[Ctiles_id].mask[i];
+        count += __popc(m);
+        // if(Ctiles[Ctiles_id].vals[i] != 0) ++count;
     }
     C_perTileNnz[Ctiles_id] = count;
 }
