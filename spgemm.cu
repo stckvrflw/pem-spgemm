@@ -614,10 +614,10 @@ int __multiply_default2(
             ValueType row_sum = warp.shfl_down(my_elem, 16);
             row_sum *= my_elem;
             // row_sum = cg::reduce(local_group, row_sum, cg::plus<ValueType>());
-            row_sum += local_group.shfl_down(row_sum, 8);            
-            row_sum += local_group.shfl_down(row_sum, 4);      
+            row_sum += local_group.shfl_down(row_sum, 1);            
             row_sum += local_group.shfl_down(row_sum, 2);      
-            row_sum += local_group.shfl_down(row_sum, 1);      
+            row_sum += local_group.shfl_down(row_sum, 4);      
+            row_sum += local_group.shfl_down(row_sum, 8);      
             row_sum = warp.shfl(row_sum, 0);    
             
             if(lgmgr == 0 &&
