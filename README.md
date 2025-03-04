@@ -22,10 +22,13 @@ Papers:
 
 
 Environment:
+* CPU       : 11th Gen Intel(R) Core(TM) i7-11800H
+* GPU       : NVIDIA Corporation GA104M [GeForce RTX 3080 Mobile / Max-Q 8GB/16GB]
 * OS        : Gentoo Linux
-* Kernel    : 6.12.10-zen1
-* CUDA      : 12.6
-* gcc       : 13.3.1_p20241220 p2
+* Kernel    : 6.12.16-gentoo
+* CUDA      : 12.8
+* driver    : 570.124.04
+* gcc       : 14.2.1 20241221
 
 [ansorge]: https://github.com/RichardAns/CUDA-Programs
 [thrust]: https://developer.nvidia.com/thrust
