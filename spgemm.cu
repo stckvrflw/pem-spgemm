@@ -2,18 +2,8 @@
 Author: Petrus E. Manurung
 */
 
-// #define USE_COOPERATIVE_LAUNCH
-// #define DEBUG_1
-// #define DEBUG_2
-// #define DEBUG_3
-// #define DEBUG_4
-// #define DEBUG_5
-// #define DEBUG_6
-// #define DEBUG_7
-// #define DEBUG_8
-// #define DEBUG_9
-
 #include <cstdlib>
+#include <cstdio>
 
 #include <fstream>
 #include <thread>
@@ -46,13 +36,14 @@ Author: Petrus E. Manurung
 namespace cg = cooperative_groups;
 
 template<typename ValueType>
-void read_matrix_market(
+void read_matrix_market
+(
     char const *matrix_path,
     thrustHvecPin<int> &I, 
     thrustHvecPin<int> &J, 
     thrustHvecPin<ValueType> &vals, 
     int &rows, int &cols, int &nnz
-    )
+)
 {
     std::ifstream file(matrix_path);
     std::vector<int> _I;
@@ -79,9 +70,9 @@ void read_matrix_market(
 }
 
 template<unsigned tileSize = 16>
-__global__ void 
-__launch_bounds__(tileSize * tileSize)
-decide_which_tile(
+__global__ void __launch_bounds__(tileSize * tileSize)
+decide_which_tile
+(
     r_Ptr<long long> participating_tiles,
     cr_Ptr<int> d_I,
     cr_Ptr<int> d_J,
@@ -106,9 +97,9 @@ decide_which_tile(
 }
 
 template<typename ValueType, int tileSize = 16>
-__global__ void 
-__launch_bounds__(tileSize * tileSize)
-generate_tiles_csr(
+__global__ void __launch_bounds__(tileSize * tileSize)
+generate_tiles_csr
+(
     r_Ptr<TileCSR_rev<ValueType, tileSize>> d_tiles,
     r_Ptr<ValueType> d_tiles_vals,
     r_Ptr<uint8_t> d_tiles_rowColIdx,
@@ -119,7 +110,8 @@ generate_tiles_csr(
     r_Ptr<int> perTileNnz,
     cr_Ptr<int> d_J,
     cr_Ptr<ValueType> d_vals,
-    cr_Ptr<int> d_rowPtr
+    cr_Ptr<int> d_rowPtr,
+    int d_rowPtr_size
 )
 {
     using MaskType = uint16_t;
@@ -147,17 +139,17 @@ generate_tiles_csr(
         auto my_row_group = cg::tiled_partition<16>(block); // swap 16 to tileSize
         
         int my_row_group_rowPtr_offset = block_tile_offset_y + my_row_group.meta_group_rank();
-        // if(my_row_group_rowPtr_offset < *d_rowPtr_size){
-            int my_row_group_rowPtr = d_rowPtr[my_row_group_rowPtr_offset];
-            int my_row_group_rowSize = d_rowPtr[my_row_group_rowPtr_offset + 1] - d_rowPtr[my_row_group_rowPtr_offset];
+        if(my_row_group_rowPtr_offset >= d_rowPtr_size) return;
 
-            int thread_offset = binarySearch(&d_J[my_row_group_rowPtr], block_tile_offset_x + (int)my_row_group.thread_rank(), my_row_group_rowSize);
-            if(thread_offset != -1){
-                thread_offset += my_row_group_rowPtr;
-                thread_J = d_J[thread_offset];
-                thread_val = d_vals[thread_offset];
-            }
-        // }
+        int my_row_group_rowPtr = d_rowPtr[my_row_group_rowPtr_offset];
+        int my_row_group_rowSize = d_rowPtr[my_row_group_rowPtr_offset + 1] - d_rowPtr[my_row_group_rowPtr_offset];
+
+        int thread_offset = binarySearch(&d_J[my_row_group_rowPtr], block_tile_offset_x + (int)my_row_group.thread_rank(), my_row_group_rowSize);
+        if(thread_offset != -1){
+            thread_offset += my_row_group_rowPtr;
+            thread_J = d_J[thread_offset];
+            thread_val = d_vals[thread_offset];
+        }
         my_row_group.sync();
 
         IdxType my_RowColIdx = (static_cast<IdxType>(my_row_group.meta_group_rank()) << 4) | (thread_J%16);
@@ -209,7 +201,8 @@ generate_tiles_csr(
 }
 
 __attribute__((optimize("O3")))
-int cusparse_highLevelMultiply(
+int cusparse_highLevelMultiply
+(
     cr_Ptr<int> dA_csrOffsets,
     cr_Ptr<int> dA_columns,
     cr_Ptr<float> dA_values,
@@ -351,8 +344,7 @@ int cusparse_highLevelMultiply(
 }
 
 template<int tileSize = 16>
-__global__ void 
-__launch_bounds__(tileSize * tileSize)
+__global__ void __launch_bounds__(tileSize * tileSize)
 _tag_rows
 (
     r_Ptr<int> rowIdx,
@@ -404,7 +396,6 @@ int __find_pairs
                 C_targetTile[targ_idx] = t_start;
             }
             else // 0 = first pass, only count how many are there
-            // pairs_idx.fetch_add(1, cuda::memory_order_relaxed);
             ++__local_count;
         }
     }
@@ -412,7 +403,8 @@ int __find_pairs
 }
 
 template<int pass>
-__global__ void __launch_bounds__(256) search_pairs
+__global__ void __launch_bounds__(256) 
+search_pairs
 (
     r_Ptr<long long> pairs,
     r_Ptr<int> C_targetTile,
@@ -461,8 +453,6 @@ __global__ void __launch_bounds__(256) search_pairs
         __find_pairs<1>(pairs, C_targetTile, t_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[t_C_col], A_rowPtr[t_C_row], AorB, B_tileOffsets);
         }
 
-        // find_all_pairs(pairs, t_C_row, b_C_cols[stage][block.thread_rank()], A_rowPtr, A_colIdx, B_colPtr, B_rowIdx);
-
         t_start += grid.num_threads();
     }
 
@@ -472,7 +462,6 @@ __global__ void __launch_bounds__(256) search_pairs
         auto warp = cg::tiled_partition<32>(block);
         if(block.thread_rank() == 0) total = 0;
         int warp_total = cg::reduce(warp, __first_pass_thread_counter, cg::plus<int>());
-        // cg::invoke_one(warp, [&b_C_cols[pass][256]](){atomicAdd_block(&b_C_cols[pass][256], warp_total);});
         if(warp.thread_rank() == 0) atomicAdd_block(&total, warp_total);
         block.sync();
         if(block.thread_rank() == 0) atomicAdd(pairs_counter, total);
@@ -488,285 +477,336 @@ __global__ void __launch_bounds__(256) search_pairs
     }
 }
 
-template<int tileSize = 16>
-__device__
-__forceinline__
-void __tile16x16_transpose_sync(auto &warp, auto *tile) 
+template<typename ValueType, int tileSize = 16>
+__global__ void __launch_bounds__(4 * 32) 
+allocate_C
+(
+    cr_Ptr<long long> d_pairs,
+    int d_pairs_size,
+
+    r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
+    int Ctiles_size,
+    r_Ptr<int> _C_perTileNnz,
+    cr_Ptr<int> C_targetTiles,
+
+    cr_Ptr<TileCSR_rev<ValueType,tileSize>> Atiles,
+    cr_Ptr<TileCSR_rev<ValueType,tileSize>> Btiles
+)
 {
-    typename std::remove_pointer<decltype(tile)>::type my_data[2][4];
+    auto grid = cg::this_grid();
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
 
-    int my_data_start[2];
-    my_data_start[0] = warp.thread_rank() / 4 * (tileSize) + warp.thread_rank() * (tileSize / 4);
-    my_data_start[1] = my_data_start[0] + 2;
+    __shared__  uint16_t tiles_mask[4 * 2 * 16];
+    
+    auto local_group = cg::tiled_partition<16>(warp); // meta group rank 0 -> row, 1 -> col, 0 loads from A, 1 from B
+    int lgmgr = local_group.meta_group_rank();
+    int lgtr = local_group.thread_rank();
+    auto isZero = [](unsigned n) __attribute__((always_inline)) { return ((n | (~n + 1)) >> 31) & 1; };
 
-    #pragma unroll
-    for(int n = 0; n < 2; ++n) {
-        int my_data_start_y = my_data_start[n] / tileSize;
-        int my_data_start_x = my_data_start[n] % tileSize;
-        
-        
-        my_data[n][0] = tile[my_data_start_y * tileSize + my_data_start_x + 0];
-        my_data[n][1] = tile[my_data_start_y * tileSize + my_data_start_x + 1]; 
-        my_data[n][2] = tile[(my_data_start_y + 1) * tileSize + my_data_start_x + 0]; 
-        my_data[n][3] = tile[(my_data_start_y + 1) * tileSize + my_data_start_x + 1]; 
+    int warp_pairs_idx_start = grid.block_rank() * 4 + warp.meta_group_rank();
+    int warp_tiles_mask_offset = warp.meta_group_rank() * 2 * 16;
+    while(warp_pairs_idx_start < d_pairs_size) 
+    {
+        int warp_tile_idx = (d_pairs[warp_pairs_idx_start] >> (32 * (lgmgr^0x1))) & 0xFFFFFFFF;
+
+        if(lgtr == 0) {
+            // optimization idea: async copy
+            auto tile = lgmgr ? Btiles : Atiles;
+            *(reinterpret_cast<ulonglong4*>(&tiles_mask[warp_tiles_mask_offset + 16 * lgmgr])) 
+            = 
+            *(reinterpret_cast<ulonglong4 const*>(&tile[warp_tile_idx].mask[0]));
+        }
+        warp.sync();
+
+        unsigned thread_mask = tiles_mask[warp_tiles_mask_offset + lgmgr * 16 + lgtr];
+
+        // calculate mask from A -> B
+        unsigned C_mask = 0;
+        #pragma unroll
+        for(int c = 0; c < tileSize; ++c) {
+            unsigned col_mask = (((thread_mask >> c) & 1U) << lgtr);
+            col_mask = cg::reduce(local_group, col_mask, cg::bit_or<unsigned>());
+            col_mask = warp.shfl_down(col_mask, 16);
+
+            C_mask |= ( isZero(thread_mask & col_mask) << c); // C_mask valid only on first halfwarp
+        }
+
+        if(lgmgr == 0) {
+            int warp_tileC_idx = C_targetTiles[warp_pairs_idx_start];
+            TileCSR_C_rev<ValueType> *tileC = Ctiles + warp_tileC_idx;
+
+            if(lgtr % 2 == 0) C_mask <<= 16;
+            C_mask |= local_group.shfl_xor(C_mask, 0x1U);
+            if(lgtr % 2 == 0)
+            {
+                auto coalesced = cg::coalesced_threads();
+                atomicOr(&tileC->mask[coalesced.thread_rank()], C_mask);
+            }
+        }
+
+        warp_pairs_idx_start += grid.num_blocks() * block.num_threads() / warp.size();
     }
 
-    #pragma unroll
-    for(int n = 0; n < 2; ++n) {
-        int my_data_start_y = my_data_start[n] / tileSize;
-        int my_data_start_x = my_data_start[n] % tileSize;
-        
-        
-        tile[my_data_start_x * tileSize + my_data_start_y + 0] = my_data[n][0];
-        tile[my_data_start_x * tileSize + my_data_start_y + 1] = my_data[n][2];
-        tile[(my_data_start_x + 1) * tileSize + my_data_start_y + 0] = my_data[n][1];
-        tile[(my_data_start_x + 1) * tileSize + my_data_start_y + 1] = my_data[n][3];
-    }
+    grid.sync();
 
-    warp.sync();
+    int local_group_Ctiles_idx_start = grid.block_rank() * 4 * 2 + warp.meta_group_rank() * 2 + lgmgr;
+    while(local_group_Ctiles_idx_start < Ctiles_size) 
+    {
+        unsigned my_Cmask = Ctiles[local_group_Ctiles_idx_start].mask[lgtr / 2];
+        my_Cmask >>= (16 * ((lgtr % 2) ^ 0x1));
+        my_Cmask &= 0xFFFF;
+        int nnz = __popc(my_Cmask);
+        int row_nnz = cg::exclusive_scan(local_group, nnz);
+        Ctiles[local_group_Ctiles_idx_start].rowPtr[lgtr] = row_nnz;
+        if(lgtr == 15) _C_perTileNnz[local_group_Ctiles_idx_start] = nnz + row_nnz;
+        local_group.sync();
+
+        local_group_Ctiles_idx_start += grid.num_blocks() * block.num_threads() / local_group.size();
+    }
+}
+
+template<typename ValueType, int tileSize = 16>
+__global__ void __launch_bounds__(4 * 32) 
+C_setOffsets
+(
+    r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
+    int Ctiles_size,
+    r_Ptr<int> _C_perTileNnz,
+    
+    r_Ptr<ValueType> Ctiles_vals,
+    r_Ptr<uint8_t> Ctiles_rowColIdx
+)
+{
+    auto grid = cg::this_grid();
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
+
+    auto local_group = cg::tiled_partition<16>(warp); // meta group rank 0 -> row, 1 -> col, 0 loads from A, 1 from B
+    int lgmgr = local_group.meta_group_rank();
+    int lgtr = local_group.thread_rank();
+
+    int local_group_Ctiles_idx_start = grid.block_rank() * 4 * 2 + warp.meta_group_rank() * 2 + lgmgr;
+    while(local_group_Ctiles_idx_start < Ctiles_size) 
+    {
+        unsigned my_Cmask = Ctiles[local_group_Ctiles_idx_start].mask[lgtr / 2];
+        my_Cmask >>= (16 * ((lgtr % 2) ^ 0x1));
+        my_Cmask &= 0xFFFF;
+        cg::invoke_one(local_group, [&]{
+            int Ctile_offset = _C_perTileNnz[local_group_Ctiles_idx_start];
+            Ctiles[local_group_Ctiles_idx_start].rowColIdx = Ctiles_rowColIdx + Ctile_offset;
+            Ctiles[local_group_Ctiles_idx_start].vals = Ctiles_vals + Ctile_offset;
+        });
+        local_group.sync();
+
+        int my_offset = cg::exclusive_scan(local_group, __popc(my_Cmask));
+
+        if(__popc(my_Cmask) > 0) 
+        {
+            for(int n = 1; n <= __popc(my_Cmask); ++n)
+            {
+                unsigned c = __fns(my_Cmask, 0, n);
+                unsigned my_rowColIdx = (lgtr << 4) | c;
+                Ctiles[local_group_Ctiles_idx_start].rowColIdx[my_offset++] = my_rowColIdx;
+            }
+        }
+
+        local_group_Ctiles_idx_start += grid.num_blocks() * block.num_threads() / local_group.size();
+    }
 }
 
 template<typename ValueType, int tileSize = 16>
 __device__ 
 __forceinline__
-int __multiply_default2(
+void __multiply_default_sync(
     cg::thread_block_tile<32, cg::thread_block> &warp,
-    int *__restrict__ myWarp_buffer,
-    TileCSR_C<ValueType> *__restrict__ tileC,
-    TileCSR_rev<ValueType> *__restrict__ tiles,
-    int tileA_shmem_nnz,
-    int tileB_shmem_nnz
+    long long *__restrict__ myWarp_buffer,
+    TileCSR_C_rev<ValueType> *__restrict__ tileC,
+    int tileC_nnz,
+    TileCSR_rev<ValueType> *__restrict__ halfwarp_tile,
+    int halfwarp_tile_nnz
 ) 
 {
     auto local_group = cg::tiled_partition<16>(warp); // meta group rank 0 -> row, 1 -> col, 0 loads from A, 1 from B
     
     int lgmgr = local_group.meta_group_rank();
     int lgtr = local_group.thread_rank();
-    // determine whether intermediate Ctile is sparse or dense using the masks
-    unsigned thread_mask = tiles[lgmgr].mask[lgtr];
 
-    auto isZero = [](unsigned n) { return ((n | (~n + 1)) >> 31) & 1; };
-    // calculate mask from A -> B -- always remember right now we are on a warp
-    unsigned C_mask = 0;
-    #pragma unroll
-    for(int c = 0; c < tileSize; ++c) {
-        unsigned col_mask = (((thread_mask >> c) & 1U) << lgtr);
-        col_mask = cg::reduce(local_group, col_mask, cg::bit_or<unsigned>());
-        col_mask = warp.shfl_down(col_mask, 16);
-
-        // if( ((thread_mask & col_mask) > 0) ) C_mask |= (1 << c);
-        C_mask |= ( isZero(thread_mask & col_mask) << c);
-    }
-
-    int nnz = __popc(C_mask); // be careful, only on local_group 0 this is valid
-    nnz = cg::reduce(local_group, nnz, cg::plus<int>());
-    nnz = warp.shfl_up(nnz, 16);
-    // if(nnz == 0) return 0;
-    if(nnz == 0) return 0;
-
-    // we loop only for nonzero C's in mask
-    #pragma unroll
-    for(int r = 0; r < tileSize; ++r) {
-        unsigned current_Cmask = warp.shfl(C_mask, r);
-        if(__popc(current_Cmask) == 0) continue;
-
-        ValueType my_sum {};
-        ValueType my_elem {};
-        
-        if(lgmgr == 0) {
-            // local_group.sync();
-            myWarp_buffer[lgtr] = -1;
-            int Arow_len = (r == tileSize - 1 ? tileA_shmem_nnz : tiles[0].rowPtr[r + 1]) - tiles[0].rowPtr[r];
-            // local_group.sync();
-
-            if(lgtr < Arow_len) {
-                // auto coalesced_group = cg::coalesced_threads();
-                int local_group_tileA_offset = tiles[0].rowPtr[r];
-                my_elem = tiles[0].vals[local_group_tileA_offset + lgtr];
-                // coalesced_group.sync();
-                myWarp_buffer[tiles[0].rowColIdx[local_group_tileA_offset + lgtr] & 0x0F] = lgtr;
-            }
-            local_group.sync();
-
-            int lowest_thread_with_0 = __ffs(local_group.ballot(my_elem == 0)) - 1;
-            if(myWarp_buffer[lgtr] == -1) myWarp_buffer[lgtr] = lowest_thread_with_0;
-            my_elem = local_group.shfl(my_elem, myWarp_buffer[lgtr]);
+    int both_lte_16 = warp.shfl_xor(halfwarp_tile_nnz, 0xFFFFU) <= 16 && halfwarp_tile_nnz <= 16;
+    if(both_lte_16) [[likely]] // register caching technique
+    {   
+        ValueType my_val {};
+        // uint8_t my_rowColIdx {};
+        uint8_t my_a{};
+        uint8_t my_b{};
+        if(lgtr < halfwarp_tile_nnz) {
+            my_val = halfwarp_tile->vals[lgtr];
+            // my_rowColIdx = halfwarp_tile->rowColIdx[lgtr];
+            my_a = ((halfwarp_tile->rowColIdx[lgtr] >> (4 * (lgmgr ^ 0x1))) & 0xFU);
+            my_b = ((halfwarp_tile->rowColIdx[lgtr] >> (4 * (lgmgr))) & 0xFU);
         }
-
         warp.sync();
 
-        int search_in_b_mask = current_Cmask;
-        while(search_in_b_mask != 0)
+        int C_idx = 0;
+        while(C_idx < tileC_nnz)
         {
-            int c = __ffs(search_in_b_mask) - 1;
-            if(lgmgr == 1) {
-                my_elem = 0; // reset
-                int thread_Brow_offset = tiles[1].rowPtr[lgtr];
-                int thread_Brow_len = (lgtr == 15 ? tileB_shmem_nnz : tiles[1].rowPtr[lgtr + 1]) - tiles[1].rowPtr[lgtr];
+            myWarp_buffer[warp.thread_rank()] = 0;
+            uint8_t C_rowColIdx = tileC->rowColIdx[C_idx];
 
-                if(thread_Brow_len != 0) {
-                    int found = binarySearch(tiles[1].rowColIdx + thread_Brow_offset, (uint8_t)((lgtr << 4) | c), thread_Brow_len);
-                    if(found != -1) my_elem = tiles[1].vals[thread_Brow_offset + found];
+            if( my_val != 0 && my_a == ((C_rowColIdx >> (4 * (lgmgr ^ 0x1))) & 0xFU) )
+            {
+                auto coalesced = cg::coalesced_threads();
+                auto fma_buf = reinterpret_cast<ValueType*>(myWarp_buffer);
+
+                unsigned match_mask = ((1 << my_b) << (16 * lgmgr));
+                match_mask = cg::reduce(coalesced, match_mask, cg::bit_or<unsigned>());
+                match_mask = (match_mask >> 16) & (match_mask & 0xFFFF);
+                int n = 0;
+                if((1 << my_b) & match_mask)
+                {
+                    auto matched = cg::coalesced_threads();
+                    n = matched.num_threads()/2;
+                    fma_buf[matched.thread_rank()] = my_val;
+                }
+                coalesced.sync();
+                if(coalesced.thread_rank() == 0)
+                {
+                    ValueType sum {};
+                    for(int i = 0; i < n; ++i) sum += fma_buf[i] * fma_buf[n+i];
+                    atomicAdd(&tileC->vals[C_idx], sum);
                 }
             }
-            // warp.sync();
-
-            ValueType row_sum = warp.shfl_down(my_elem, 16);
-            row_sum *= my_elem;
-            // row_sum = cg::reduce(local_group, row_sum, cg::plus<ValueType>());
-            row_sum += local_group.shfl_down(row_sum, 1);            
-            row_sum += local_group.shfl_down(row_sum, 2);      
-            row_sum += local_group.shfl_down(row_sum, 4);      
-            row_sum += local_group.shfl_down(row_sum, 8);      
-            row_sum = warp.shfl(row_sum, 0);    
-            
-            if(lgmgr == 0 &&
-                lgtr == c) my_sum = row_sum;
-            
-            // auto fma_buf = reinterpret_cast<ValueType*>(myWarp_buffer);
-            // *(fma_buf + warp.thread_rank()) = my_elem;
-            // if(lgmgr == 0 && lgtr == c) {
-            //     #pragma unroll
-            //     for(int i = 0; i < 16; ++i) 
-            //     // if(fma_buf[i] !=0 && fma_buf[i+16] !=0)
-            //     my_sum += fma_buf[i] * fma_buf[i + 16];
-            //     // atomicAdd((float*)&tileC->vals[r*tileSize+lgtr], fma_buf[i] * fma_buf[i * 16]);
-            // }
-
-            search_in_b_mask &= (~(1 << c));
+            warp.sync();
+            ++C_idx;
         }
+    }
+    else [[unlikely]]
+    {
+        unsigned C_mask = ((tileC->mask[lgtr/2]) >> (16 * ((lgtr % 2) ^ 0x1))) & 0xFFFF;
+        int C_curr_counter = 0;
+        #pragma unroll
+        for(int r = 0; r < tileSize; ++r) {
+            unsigned current_Cmask = warp.shfl(C_mask, r);
+            if(__popc(current_Cmask) == 0) continue;
 
-        warp.sync();
+            ValueType my_sum {};
+            ValueType my_elem {};
+            
+            if(lgmgr == 0) {
+                myWarp_buffer[lgtr] = -1;
+                int Arow_len = (r == tileSize - 1 ? halfwarp_tile_nnz : halfwarp_tile->rowPtr[r + 1]) - halfwarp_tile->rowPtr[r];
 
-        // store
-        if(lgmgr == 0) {
-            if(my_sum != 0) 
-            {
-                atomicAdd(&tileC->vals[r * tileSize + lgtr], my_sum);
-                // ++my_nnz;
+                if(lgtr < Arow_len) {
+                    int local_group_tileA_offset = halfwarp_tile->rowPtr[r];
+                    my_elem = halfwarp_tile->vals[local_group_tileA_offset + lgtr];
+                    myWarp_buffer[halfwarp_tile->rowColIdx[local_group_tileA_offset + lgtr] & 0x0F] = lgtr;
+                }
+                local_group.sync();
+
+                int lowest_thread_with_0 = __ffs(local_group.ballot(my_elem == 0)) - 1;
+                if(myWarp_buffer[lgtr] == -1) myWarp_buffer[lgtr] = lowest_thread_with_0;
+                my_elem = local_group.shfl(my_elem, myWarp_buffer[lgtr]);
             }
-            // if(lgtr == r) tileC->mask[r] |= C_mask;
-            // tileC->mask[lgtr] |= C_mask;
-            // if(lgtr == 0) atomicMax(&_C_perTileNnz[warp_tileC_idx], tileC_nnz);
+            warp.sync();
+
+            for(int n = 1; n <= __popc(current_Cmask); ++n)
+            {
+                int c = __fns(current_Cmask, 0, n);
+                if(lgmgr == 1) {
+                    my_elem = 0; // reset
+                    int thread_Brow_offset = halfwarp_tile->rowPtr[lgtr];
+                    int thread_Brow_len = (lgtr == 15 ? halfwarp_tile_nnz : halfwarp_tile->rowPtr[lgtr + 1]) - halfwarp_tile->rowPtr[lgtr];
+
+                    if(thread_Brow_len != 0) {
+                        int found = binarySearch(halfwarp_tile->rowColIdx + thread_Brow_offset, (uint8_t)((lgtr << 4) | c), thread_Brow_len);
+                        if(found != -1) my_elem = halfwarp_tile->vals[thread_Brow_offset + found];
+                    }
+                }
+
+                if constexpr(std::is_floating_point_v<ValueType> && sizeof(ValueType) == 8)
+                {
+                ValueType row_sum = warp.shfl_down(my_elem, 16);
+                row_sum *= my_elem;
+                row_sum += local_group.shfl_down(row_sum, 1);            
+                row_sum += local_group.shfl_down(row_sum, 2);      
+                row_sum += local_group.shfl_down(row_sum, 4);      
+                row_sum += local_group.shfl_down(row_sum, 8);      
+                row_sum = warp.shfl(row_sum, 0);    
+                if(lgmgr == 0 && lgtr == c) my_sum = row_sum;
+                } 
+                else {
+                auto fma_buf = reinterpret_cast<ValueType*>(myWarp_buffer);
+                *(fma_buf + warp.thread_rank()) = my_elem;
+                if(lgmgr == 0 && lgtr == c) {
+                    #pragma unroll
+                    for(int i = 0; i < 16; ++i) 
+                    my_sum += fma_buf[i] * fma_buf[i + 16];
+                    atomicAdd(&tileC->vals[C_curr_counter+(n-1)], my_sum);
+                }
+                }
+            }
+            C_curr_counter += __popc(current_Cmask);
+            warp.sync();
+
+            // store
+            // if(lgmgr == 0 && my_sum != 0) atomicAdd(&tileC->vals[r * tileSize + lgtr], my_sum);
+            // warp.sync();
         }
-        warp.sync();
     }
-    // my_nnz = cg::reduce(warp, my_nnz, cg::plus<int>());
-    // return my_nnz;
-    if(lgmgr == 0) {
-        if(lgtr % 2 == 0) C_mask <<= 16;
-        C_mask |= local_group.shfl_xor(C_mask, 0x1U);
-        if(lgtr % 2 == 0)
-        {
-            auto coalesced = cg::coalesced_threads();
-            atomicOr((unsigned*)&tileC->mask[coalesced.thread_rank()*2], C_mask);
-        }
-    }
-    warp.sync();
-    return nnz;
 }
 
-
-template<typename ValueType>
-__device__ __forceinline__ void warp_load_tile(cg::thread_block_tile<32, cg::thread_block> &warp, auto tile, auto warp_tiles_start) {
-        constexpr int use_size = sizeof(ulonglong4); // 32byte
-        static_assert(use_size == 32);
-        constexpr int total_chunk = sizeof(TileCSR<ValueType>) / use_size;
-        
-        
-        int thread_start = warp.thread_rank();
-        while(thread_start < total_chunk) {
-            *(reinterpret_cast<ulonglong4*>(warp_tiles_start) + thread_start) = *(reinterpret_cast<const ulonglong4*>(tile) + thread_start);
-            thread_start += warp.size();
-        }
-        if(thread_start == 41) {
-            *(reinterpret_cast<uint4*>(warp_tiles_start) + thread_start * 2) = *(reinterpret_cast<uint4 const*>(tile) + thread_start * 2);
-        }
-        // warp.sync();
-    };
 
 template<typename ValueType, int tileSize = 16>
 __global__ void 
 __launch_bounds__(tileSize * tileSize / 2)
-multiply_pairs(
+multiply_pairs
+(
     cr_Ptr<long long> d_pairs,
     int d_pairs_size,
     
-    cr_Ptr<int> _C_tilePtr,
-    int _C_tilePtr_size,
-    cr_Ptr<int> _C_tileColIdx,
-    r_Ptr<TileCSR_C<ValueType, tileSize>> Ctiles,
+    r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
     r_Ptr<int> _C_perTileNnz,
     cr_Ptr<int> C_targetTiles,
 
-    cr_Ptr<int> _A_tileRowPtr,
-    int _A_tileRowPtr_size,
-    cr_Ptr<int> _A_tileColIdx,
     cr_Ptr<TileCSR_rev<ValueType,tileSize>> Atiles,
     cr_Ptr<int> _A_perTileNnz,
 
-    cr_Ptr<int> _B_tileColPtr,
-    int _B_tileColPtr_size,
-    cr_Ptr<int> _B_tileRowIdx,
     cr_Ptr<TileCSR_rev<ValueType,tileSize>> Btiles,
     cr_Ptr<int> _B_perTileNnz
-    // cr_Ptr<int> _B_tileOffsets
-    )
+)
 {
     auto grid = cg::this_grid();
     auto block = cg::this_thread_block();
     auto warp = cg::tiled_partition<32>(block);
 
     extern __shared__ __align__(16) unsigned char tiles[];
-    __shared__ int perWarp_buffer[4 * 32];
+    __shared__ long long perWarp_buffer[4 * 32];
 
     perWarp_buffer[threadIdx.x] = 0;
-
-    auto warp_load_tile_lambda = [](
-        auto const &half_warp, 
-        auto *tile,
-        int tile_nnz, 
-        auto *warp_tiles_start) __attribute__((always_inline)) 
-        {
-            int local_rank = half_warp.thread_rank();
-            warp_tiles_start->mask[local_rank] = tile->mask[local_rank];
-            warp_tiles_start->rowPtr[local_rank] = tile->rowPtr[local_rank];
-            while(local_rank < tile_nnz) {
-                warp_tiles_start->vals[local_rank] = tile->vals[local_rank];
-                warp_tiles_start->rowColIdx[local_rank] = tile->rowColIdx[local_rank];
-                local_rank += half_warp.size();
-            }
-        };
     
-        auto warp_load_tile_lambda2 = [](
-            auto const &half_warp, 
-            auto *tile,
-            auto *warp_tiles_start) __attribute__((always_inline)) 
-            {
-                int local_rank = half_warp.thread_rank();
-                if(local_rank ==0 || local_rank == 1)
-                *(reinterpret_cast<ulonglong4*>(warp_tiles_start) + local_rank) = *(reinterpret_cast<ulonglong4 const*>(tile) + local_rank);
-                
-            };
+    // optimize later: streaming cache hint
+    auto warp_load_tile_lambda = [](auto const &halfwarp, auto *tile, auto *halfwarp_tiles_start) __attribute__((always_inline)) 
+    {
+        int local_rank = halfwarp.thread_rank();
+        if(local_rank == 0 || local_rank == 1)
+        *(reinterpret_cast<ulonglong4*>(halfwarp_tiles_start) + local_rank) = *(reinterpret_cast<ulonglong4 const*>(tile) + local_rank);
+    };
 
     int warp_pairs_idx_start = grid.block_rank() * 4 + warp.meta_group_rank();
     TileCSR_rev<ValueType> *warp_shmem_tile_start = reinterpret_cast<TileCSR_rev<ValueType>*>(tiles) + warp.meta_group_rank() * 2;
-    while(warp_pairs_idx_start < d_pairs_size) {
-        int warp_tile_idx[2];
+    while(warp_pairs_idx_start < d_pairs_size) 
+    {
+        auto halfwarp = cg::tiled_partition<16>(warp);
+        int halfwarp_mgr = halfwarp.meta_group_rank();
+        auto halfwarp_tile = (halfwarp_mgr == 0) ? Atiles : Btiles;
+        // int halfwarp_tile_idx = ((d_pairs[warp_pairs_idx_start] >> (32 * (halfwarp_mgr ^ 0x1))) & 0xFFFF);
+        int halfwarp_tile_idx = *(reinterpret_cast<int const*>(&d_pairs[warp_pairs_idx_start]) + (halfwarp_mgr ^ 0x1));
 
-        long long warp_pairs = d_pairs[warp_pairs_idx_start];
-        warp_tile_idx[0] = *(reinterpret_cast<int*>(&warp_pairs)+1);
-        warp_tile_idx[1] = *(reinterpret_cast<int*>(&warp_pairs));
-
-        int tile_nnz[2];
-        tile_nnz[0] = _A_perTileNnz[warp_tile_idx[0]+1] - _A_perTileNnz[warp_tile_idx[0]];
-        tile_nnz[1] = _B_perTileNnz[warp_tile_idx[1]+1] - _B_perTileNnz[warp_tile_idx[1]];
-
-        auto half_warp = cg::tiled_partition<16>(warp);
-        int half_warp_mgr = half_warp.meta_group_rank();
-        auto half_warp_tile = (half_warp_mgr == 0) ? Atiles : Btiles;
-        // warp_load_tile_lambda(half_warp, half_warp_tile + warp_tile_idx[half_warp_mgr], tile_nnz[half_warp_mgr], warp_shmem_tile_start + half_warp_mgr);
-        warp_load_tile_lambda2(half_warp, half_warp_tile + warp_tile_idx[half_warp_mgr], warp_shmem_tile_start + half_warp_mgr);
+        int tile_nnz = (halfwarp_mgr == 0) 
+                     ? (_A_perTileNnz[halfwarp_tile_idx+1] - _A_perTileNnz[halfwarp_tile_idx]) 
+                     : (_B_perTileNnz[halfwarp_tile_idx+1] - _B_perTileNnz[halfwarp_tile_idx]);
+        
+        warp_load_tile_lambda(halfwarp, halfwarp_tile + halfwarp_tile_idx, warp_shmem_tile_start + halfwarp_mgr);
         warp.sync();
 
         // cg::memcpy_async(warp, warp_shmem_tile_start, Atiles + warp_Atile_idx, sizeof(TileCSR<ValueType>));
@@ -774,9 +814,10 @@ multiply_pairs(
         // cg::wait(warp);
 
         int warp_tileC_idx = C_targetTiles[warp_pairs_idx_start];
-        TileCSR_C<ValueType> *tileC = Ctiles + warp_tileC_idx;
+        TileCSR_C_rev<ValueType> *tileC = Ctiles + warp_tileC_idx;
+        int tileC_nnz = _C_perTileNnz[warp_tileC_idx + 1] - _C_perTileNnz[warp_tileC_idx];
 
-        int tileC_nnz = __multiply_default2(warp, perWarp_buffer + tileSize * 2 * warp.meta_group_rank(), tileC, warp_shmem_tile_start, tile_nnz[0], tile_nnz[1]);
+        __multiply_default_sync(warp, perWarp_buffer + tileSize * 2 * warp.meta_group_rank(), tileC, tileC_nnz, warp_shmem_tile_start + halfwarp_mgr, tile_nnz);
 
         warp_pairs_idx_start += grid.num_blocks() * block.num_threads() / warp.size();
     }
@@ -809,17 +850,18 @@ void warp_exclusive_scan_sync(auto &warp_group, r_Ptr<int> arr, r_Ptr<int> temp_
 }
 
 template<typename ValueType, int tileSize = 16>
-__global__ void 
-__launch_bounds__(tileSize * tileSize)
-sanitize_C(
+__global__ void __launch_bounds__(tileSize * tileSize)
+sanitize_C
+(
     r_Ptr<int> rows, 
     r_Ptr<int> cols, 
     r_Ptr<ValueType> vals, 
-    cr_Ptr<TileCSR_C<ValueType>> Ctiles, 
+    cr_Ptr<TileCSR_C_rev<ValueType>> Ctiles, 
     cr_Ptr<int> _C_rowPtr, 
     int _C_rowPtrSize,
     cr_Ptr<int> _C_tileColIdx, 
-    cr_Ptr<int> _C_perTile_Nnz)
+    cr_Ptr<int> _C_perTile_Nnz
+)
 {
     __shared__ int permute[256];
     __shared__ int temp_buffer[8];
@@ -859,19 +901,6 @@ sanitize_C(
     }
 }
 
-template<typename ValueType>
-__global__ void count_pertile_nnz(r_Ptr<int> C_perTileNnz, cr_Ptr<TileCSR_C<ValueType>> Ctiles)
-{
-    int Ctiles_id = cg::this_grid().block_rank();
-    int count = 0;
-    for(int i = 0; i < 16; ++i) {
-        unsigned m = Ctiles[Ctiles_id].mask[i];
-        count += __popc(m);
-        // if(Ctiles[Ctiles_id].vals[i] != 0) ++count;
-    }
-    C_perTileNnz[Ctiles_id] = count;
-}
-
 #define STREAM_A streams[STREAMA]
 #define STREAM_B streams[STREAMB]
 #define STREAM_C streams[STREAMC]
@@ -887,6 +916,19 @@ enum STREAMS {
     STREAMS_COUNT,
 };
 
+// #define USE_COOPERATIVE_LAUNCH
+// #define DEBUG_1
+// #define DEBUG_2
+// #define DEBUG_3
+// #define DEBUG_4
+// #define DEBUG_5
+// #define DEBUG_6
+// #define DEBUG_7
+// #define DEBUG_8
+// #define DEBUG_9
+// #define DEBUG_10
+// #define DEBUG_11
+
 int main(int argc, char *argv[]) {
     if(argc <= 1 || argc > 3) {
         std::cout << "Provide matrix market file path for A and B (or TRANSPOSE for A * At). Exiting\n";
@@ -894,7 +936,7 @@ int main(int argc, char *argv[]) {
     }
 
     constexpr int tileSize = 16;
-    using ValueType = float;
+    using ValueType = double;
 
     std::array<cudaStream_t, STREAMS_COUNT> streams;
     std::for_each(streams.begin(), streams.end(), [](cudaStream_t &s){cudaStreamCreate(&s);});
@@ -917,17 +959,19 @@ int main(int argc, char *argv[]) {
     read_matrix_market(argv[2], B_I, B_J, B_val, B_rows, B_cols, B_nnz);
     read_A.join();
 
-    std::cout << "MATRIX A\n";
-    std::cout << "filepath: " << argv[1] << std::endl;
-    std::cout << "Rows: " << A_rows << std::endl;
-    std::cout << "Cols: " << A_cols << std::endl;
-    std::cout << "Nnz: " << A_nnz << std::endl;
+    std::cout 
+    << "MATRIX A\n"
+    << "filepath: " << argv[1] << "\n"
+    << "Rows: " << A_rows << "\n"
+    << "Cols: " << A_cols << "\n"
+    << "Nnz: " << A_nnz << "\n";
 
-    std::cout << "\nMATRIX B\n";
-    std::cout << "filepath: " << argv[2] << std::endl;
-    std::cout << "Rows: " << B_rows << std::endl;
-    std::cout << "Cols: " << B_cols << std::endl;
-    std::cout << "Nnz: " << B_nnz << std::endl;
+    std::cout 
+    << "MATRIX B\n"
+    << "filepath: " << argv[2] << "\n"
+    << "Rows: " << B_rows << "\n"
+    << "Cols: " << B_cols << "\n"
+    << "Nnz: " << B_nnz << "\n";
 
     int const OVERHEAD = (A_nnz + B_nnz) / 4;
     auto SPGEMM_MR = rmm::mr::cuda_async_memory_resource(sizeof(ValueType) * 2 * (A_nnz + B_nnz + OVERHEAD));
@@ -935,9 +979,8 @@ int main(int argc, char *argv[]) {
     auto SPGEMM_STREAM_ALLOCATOR_FLOAT = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<float>(STREAM, SPGEMM_MR);};
     auto SPGEMM_STREAM_ALLOCATOR_LONGLONG = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<long long>(STREAM, SPGEMM_MR);};
     auto SPGEMM_STREAM_ALLOCATOR_VALUETYPE = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<ValueType>(STREAM, SPGEMM_MR);};
-    auto SPGEMM_STREAM_ALLOCATOR_TILECSR = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<TileCSR<ValueType>>(STREAM, SPGEMM_MR);};
-    auto SPGEMM_STREAM_ALLOCATOR_TILECSRC = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<TileCSR_C<ValueType>>(STREAM, SPGEMM_MR);};
     auto SPGEMM_STREAM_ALLOCATOR_TILECSR_REV = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<TileCSR_rev<ValueType>>(STREAM, SPGEMM_MR);};
+    auto SPGEMM_STREAM_ALLOCATOR_TILECSRC_REV = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<TileCSR_C_rev<ValueType>>(STREAM, SPGEMM_MR);};
     auto SPGEMM_STREAM_ALLOCATOR_UINT8 = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<uint8_t>(STREAM, SPGEMM_MR);};
 
     auto SPGEMM_TEMPORARY_MR = rmm::mr::cuda_async_memory_resource(sizeof(char) * OVERHEAD);
@@ -973,8 +1016,6 @@ int main(int argc, char *argv[]) {
     int A_tileCols = (A_cols-1+tileSize) / tileSize;
     int B_tileRows = (B_rows-1+tileSize) / tileSize;
     int B_tileCols = (B_cols-1+tileSize) / tileSize;
-    // rmm::device_vector<long long> A_participating_tiles(A_tileRows * A_tileCols, -1, SPGEMM_STREAM_ALLOCATOR_LONGLONG(STREAM_A));
-    // rmm::device_vector<long long> B_participating_tiles(B_tileRows * B_tileCols, -1, SPGEMM_STREAM_ALLOCATOR_LONGLONG(STREAM_B));
     rmm::device_vector<long long> A_participating_tiles(A_nnz, -1, SPGEMM_STREAM_ALLOCATOR_LONGLONG(STREAM_A));
     rmm::device_vector<long long> B_participating_tiles(B_nnz, -1, SPGEMM_STREAM_ALLOCATOR_LONGLONG(STREAM_B));
 
@@ -1160,7 +1201,8 @@ int main(int argc, char *argv[]) {
         A_perTileNnz.data().get(), 
         A_d_J.data().get(), 
         A_d_val.data().get(), 
-        A_d_rowPtr.data().get()
+        A_d_rowPtr.data().get(),
+        A_rows
     );
 
     dim3 B_threads_gtc {tileSize * tileSize};
@@ -1183,8 +1225,10 @@ int main(int argc, char *argv[]) {
         B_perTileNnz.data().get(), 
         B_d_J.data().get(), 
         B_d_val.data().get(), 
-        B_d_rowPtr.data().get()
+        B_d_rowPtr.data().get(),
+        B_rows
     );
+
 
 #ifdef USE_COOPERATIVE_LAUNCH
 
@@ -1309,8 +1353,7 @@ int main(int argc, char *argv[]) {
         }
     });
 #endif
-    // cudaDeviceSynchronize();
-    // return 0; // <--------------------------------------------------------------------------------------------------------------------------------
+
     // create High level Representation of A -> A_
     rmm::device_vector<int> _A_tileRowPtr(A_tileRows + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_D));
     rmm::device_vector<int> _A_tileColIdx(A_participating_tiles.size(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_D));
@@ -1524,7 +1567,7 @@ int main(int argc, char *argv[]) {
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, 0);
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm_sp, search_pairs<0>, numThreads_sp, 0);
-    std::cout << "Max block count per SM with 256 threads: " << numBlocksPerSm_sp << "\n";
+    std::cout << "search_pairs<0> Max block count per SM with 256 threads: " << numBlocksPerSm_sp << "\n";
 
     dim3 threads_sp {numThreads_sp};
     dim3 blocks_sp {numBlocksPerSm_sp * deviceProp.multiProcessorCount};
@@ -1569,7 +1612,7 @@ int main(int argc, char *argv[]) {
         static_cast<void*>(&pairs_count)
     };
 
-    cudaStreamSynchronize(STREAM_B); // verify later
+    cudaStreamSynchronize(STREAM_B); // _B_tileOffsets comes from STREAM_B
     // first pass
     CHECK_CUDA( cudaLaunchCooperativeKernel((void*)search_pairs<0>, blocks_sp, threads_sp, kern_args, 0, STREAM_C) )
     cudaStreamSynchronize(STREAM_C);
@@ -1582,7 +1625,6 @@ int main(int argc, char *argv[]) {
     kern_args[0] = static_cast<void*>(&ptr1);
     kern_args[1] = static_cast<void*>(&ptr2);
     cudaMemsetAsync(pairs_count, 0, sizeof(int), STREAM_C);
-    // blocks_sp.x = 7;
     CHECK_CUDA( cudaLaunchCooperativeKernel((void*)search_pairs<1>, blocks_sp, threads_sp, kern_args, 0, STREAM_C) )
 
 #ifdef DEBUG_9
@@ -1634,39 +1676,91 @@ int main(int argc, char *argv[]) {
     });
 #endif
 
-    // cudaStreamSynchronize(STREAM_C);
-    // cudaFreeAsync(_C_tileColIdx_size, STREAM_C);
-    // cudaFreeAsync(_C_tilePtr_size, STREAM_C);
-    // cudaFreeAsync(pairs_count, STREAM_C);
+    rmm::device_vector<TileCSR_C_rev<ValueType>> Ctiles(_C_tileColIdx.size(), SPGEMM_STREAM_ALLOCATOR_TILECSRC_REV(STREAM_C));
+    rmm::device_vector<int> _C_perTileNnz(_C_tileColIdx.size() + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
+    
+    int numBlocksPerSm_aC = 0;
+    int numThreads_aC = 128;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm_aC, (void*)allocate_C<ValueType>, numThreads_aC, 0);
+    std::cout << "allocate_C Max block count per SM with 128 threads: " << numBlocksPerSm_aC << "\n";
 
+    auto args1 = d_pairs.data().get();
+    auto args2 = d_pairs.size();
+    auto args3 =  Ctiles.data().get();
+    auto args4 = Ctiles.size();
+    auto args5 = _C_perTileNnz.data().get();
+    auto args6 = C_targetTile.data().get();
+    auto args7 =  Atiles.data().get();
+    auto args8 =  Btiles.data().get();
 
-    // auto C_MR = rmm::mr::cuda_async_memory_resource(sizeof(TileCSR_C<ValueType>) * _C_tileColIdx.size() + sizeof(int) * (_C_tileColIdx.size() + 1) + 512);
-    // auto C_TILECSRC_ALLOC = rmm::mr::thrust_allocator<TileCSR_C<ValueType>>(STREAM_C, C_MR);
-    // auto C_INT_ALLOC = rmm::mr::thrust_allocator<int>(STREAM_C, C_MR);
-    rmm::device_vector<TileCSR_C<ValueType>> Ctiles(_C_tileColIdx.size(), SPGEMM_STREAM_ALLOCATOR_TILECSRC(STREAM_C));
-    rmm::device_vector<int> _C_perTileNnz(Ctiles.size() + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
+    void *args[] = {
+        static_cast<void*>(&args1),
+        static_cast<void*>(&args2),
+        static_cast<void*>(&args3),
+        static_cast<void*>(&args4),
+        static_cast<void*>(&args5),
+        static_cast<void*>(&args6),
+        static_cast<void*>(&args7),
+        static_cast<void*>(&args8),
+    };
+
+    dim3 threads_aC {numThreads_aC};
+    dim3 blocks_aC {numBlocksPerSm_aC * deviceProp.multiProcessorCount};
+    CHECK_CUDA( cudaLaunchCooperativeKernel((void*)allocate_C<ValueType>, blocks_aC, threads_aC, args, 0, STREAM_C) )
+    thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_C), _C_perTileNnz.begin(), _C_perTileNnz.end(), _C_perTileNnz.begin());
+
+    rmm::device_vector<ValueType> Ctiles_vals(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_VALUETYPE(STREAM_C));
+    rmm::device_vector<typename TileCSR_C_rev<ValueType>::IdxType> Ctiles_rowColIdx(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_UINT8(STREAM_C));
+
+    int numBlocksPerSm_Cs = 0;
+    int numThreads_Cs = 128;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm_Cs, (void*)C_setOffsets<ValueType>, numThreads_Cs, 0);
+    std::cout << "C_setOffsets Max block count per SM with 128 threads: " << numBlocksPerSm_Cs << "\n";
+
+    auto args9 = Ctiles_vals.data().get();
+    auto args10 = Ctiles_rowColIdx.data().get();
+    void *args_2[] = {
+        static_cast<void*>(&args3),
+        static_cast<void*>(&args4),
+        static_cast<void*>(&args5),
+        static_cast<void*>(&args9),
+        static_cast<void*>(&args10)
+    };
+
+    dim3 threads_Cs {numThreads_Cs};
+    dim3 blocks_Cs {numBlocksPerSm_Cs * deviceProp.multiProcessorCount};
+    CHECK_CUDA( cudaLaunchCooperativeKernel((void*)C_setOffsets<ValueType>, blocks_Cs, threads_Cs, args_2, 0, STREAM_C) ); // change blocks and threads later?
+
+#ifdef DEBUG_10
+    std::jthread DEBUG_10([&]{
+        cudaStreamSynchronize(STREAM_C);
+        char const *filename = "../src/DEBUG/DEBUG_C_10";
+        std::ofstream outfile;
+        outfile.open(filename, std::ios::out);
+
+        outfile << "C nnz\n" << _C_perTileNnz.back() << "\n\n";
+
+        thrustHvecPin<TileCSR_C_rev<ValueType>> hCtiles = Ctiles;
+        thrustHvecPin<int> hCtilesNnz = _C_perTileNnz;
+        for(int n = 0; n < hCtiles.size(); ++n)
+        {
+            outfile << "TILE " << n << "\n";
+            printInfo(outfile, hCtiles[n], hCtilesNnz[n+1] - hCtilesNnz[n]);
+            outfile << "\n";
+        }
+        outfile.close();
+    });
+#endif  
 
     auto arg1 = d_pairs.data().get();
     auto arg2 = d_pairs.size();
-    auto arg3 =   _C_tilePtr.data().get();
-    auto arg4 =   _C_tilePtr.size();
-    auto arg5 =  _C_tileColIdx.data().get();
-    auto arg6 =  Ctiles.data().get();
-    auto arg7 =  _C_perTileNnz.data().get();
-    auto arg8 = C_targetTile.data().get();
-    auto arg9 =  _A_tileRowPtr.data().get();
-    auto arg10 =  _A_tileRowPtr.size();
-    auto arg11 =  _A_tileColIdx.data().get();
-    auto arg12 =  Atiles.data().get();
-    auto arg13 =  A_perTileNnz.data().get();
-    auto arg14 =  _B_tileColPtr.data().get();
-    auto arg15 =  _B_tileColPtr.size();
-    auto arg16 =  _B_tileRowIdx.data().get();
-    auto arg17 =  Btiles.data().get();
-    auto arg18 =  B_perTileNnz.data().get();
-    // auto arg19 =  _B_tileOffsets.data().get();
-    
-    cudaStreamSynchronize(STREAM_B);
+    auto arg3 =  Ctiles.data().get();
+    auto arg4 =  _C_perTileNnz.data().get();
+    auto arg5 = C_targetTile.data().get();
+    auto arg6 =  Atiles.data().get();
+    auto arg7 =  A_perTileNnz.data().get();
+    auto arg8 =  Btiles.data().get();
+    auto arg9 =  B_perTileNnz.data().get();
 
     void *kernArgs[] = {
         static_cast<void*>(&arg1),
@@ -1678,27 +1772,45 @@ int main(int argc, char *argv[]) {
         static_cast<void*>(&arg7),
         static_cast<void*>(&arg8),
         static_cast<void*>(&arg9),
-        static_cast<void*>(&arg10),
-        static_cast<void*>(&arg11),
-        static_cast<void*>(&arg12),
-        static_cast<void*>(&arg13),
-        static_cast<void*>(&arg14),
-        static_cast<void*>(&arg15),
-        static_cast<void*>(&arg16),
-        static_cast<void*>(&arg17),
-        static_cast<void*>(&arg18),
-        // static_cast<void*>(&arg19)
     };
 
     int numBlocksPerSm_mp = 0;
     int numThreads_mp = 128;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm_mp, (void*)multiply_pairs<ValueType>, numThreads_mp, sizeof(TileCSR_rev<ValueType>) * 8);
-    std::cout << "Max block count per SM with 128 threads: " << numBlocksPerSm_mp << "\n";
+    std::cout << "multiply_pairs Max block count per SM with 128 threads: " << numBlocksPerSm_mp << "\n";
 
     dim3 threads_mp {numThreads_mp};
     dim3 blocks_mp {numBlocksPerSm_mp * deviceProp.multiProcessorCount};
     CHECK_CUDA( cudaLaunchCooperativeKernel((void*)multiply_pairs<ValueType>, blocks_mp, threads_mp, kernArgs, sizeof(TileCSR_rev<ValueType>) * 8, STREAM_C) )
 
+#ifdef DEBUG_11
+    std::jthread DEBUG_11([&]{
+        cudaStreamSynchronize(STREAM_C);
+        std::cout << "ALGORITHM FINISHED\n";
+        char const *filename = "../src/DEBUG/DEBUG_C_11";
+        std::ofstream outfile;
+        outfile.open(filename, std::ios::out);
+
+        outfile << "C nnz\n" << _C_perTileNnz.back() << "\n\n";
+
+        thrustHvecPin<ValueType> Cvals = Ctiles_vals;
+        thrustHvecPin<uint8_t> CrowColIdx = Ctiles_rowColIdx;
+
+        outfile << "VALS\n";
+        for(auto v: Cvals) outfile << v << " ";
+        outfile << "\nROWCOLIDX\n";
+        for(auto rc: CrowColIdx) {
+            // std::bitset<8> b (rc);
+            // outfile << b.to_string().c_str() << " ";
+
+            auto r = rc >> 4;
+            auto c = rc & 0xF;
+            outfile << r << "-" << c << " ";
+        }
+
+        outfile.close();
+    });
+#endif
 
 #ifdef DEBUG_7
     std::jthread DEBUG_7([&](){
@@ -1727,40 +1839,31 @@ int main(int argc, char *argv[]) {
     });
 #endif
 
-    dim3 threads_cpn{1};
-    dim3 blocks_cpn{_C_perTileNnz.size()-1};
-    count_pertile_nnz<<<blocks_cpn, threads_cpn, 0, STREAM_C>>>(_C_perTileNnz.data().get(), Ctiles.data().get());
-
-    thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_C), _C_perTileNnz.begin(), _C_perTileNnz.end(), _C_perTileNnz.begin());
-    std::jthread (
-        [&]{
-            cudaStreamSynchronize(STREAM_C);
-            std::cout << "DEBUG: _C_perTileNnz.back() " << _C_perTileNnz.back() << "\n";
-        }
-    );
+    cudaStreamSynchronize(STREAM_C);
+    std::cout << "C nnz: " << _C_perTileNnz.back() << "\n";
 
     std::quick_exit(0);
     // std::atexit([]{cudaDeviceReset();});
     return 0; // <--------------------------------------------------------------------------------------------------------------------------------
 
-    rmm::device_vector<int> Crows(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
-    rmm::device_vector<int> Ccols(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
-    rmm::device_vector<ValueType> Cvals(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_VALUETYPE(STREAM_C));
+    // rmm::device_vector<int> Crows(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
+    // rmm::device_vector<int> Ccols(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
+    // rmm::device_vector<ValueType> Cvals(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_VALUETYPE(STREAM_C));
 
-    dim3 threads_sC {tileSize * tileSize};
-    dim3 blocks_sC {Ctiles.size()};
+    // dim3 threads_sC {tileSize * tileSize};
+    // dim3 blocks_sC {Ctiles.size()};
 
-    sanitize_C<<<blocks_sC, threads_sC, 0, STREAM_C>>>
-    (
-        Crows.data().get(), 
-        Ccols.data().get(), 
-        Cvals.data().get(), 
-        Ctiles.data().get(), 
-        _C_tilePtr.data().get(),
-        _C_tilePtr.size(), 
-        _C_tileColIdx.data().get(), 
-        _C_perTileNnz.data().get()
-    );
+    // sanitize_C<<<blocks_sC, threads_sC, 0, STREAM_C>>>
+    // (
+    //     Crows.data().get(), 
+    //     Ccols.data().get(), 
+    //     Cvals.data().get(), 
+    //     Ctiles.data().get(), 
+    //     _C_tilePtr.data().get(),
+    //     _C_tilePtr.size(), 
+    //     _C_tileColIdx.data().get(), 
+    //     _C_perTileNnz.data().get()
+    // );
 
 #ifdef DEBUG_8
     std::jthread DEBUG_8([&](){
@@ -1790,8 +1893,6 @@ int main(int argc, char *argv[]) {
         outfile.close();
     });
 #endif
-    
-    cudaStreamSynchronize(STREAM_C); // DELETE LATER
 
     // streams are destroyed by rmm
 }

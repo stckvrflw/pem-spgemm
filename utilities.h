@@ -151,7 +151,7 @@ struct is_not_neg1 {
 
 
 template<typename ValueType, int tileSize>
-void printInfo(std::ofstream &outfile, TileCSR<ValueType,tileSize> const &tile, int tileNnz) noexcept
+void printInfo(std::ofstream &outfile, TileCSR_rev<ValueType,tileSize> const &tile, int tileNnz) noexcept
 {
     outfile << "TileCSR:\n";
     outfile << "  mask:\n";
@@ -187,8 +187,91 @@ void printInfo(std::ofstream &outfile, TileCSR<ValueType,tileSize> const &tile, 
     outfile << "\n\n";
 }
 
+// template<typename ValueType, int tileSize>
+// void printInfo(
+//     std::ofstream &outfile, TileCSR_rev<ValueType,tileSize> const &tile, int tileNnz) noexcept
+// {
+//     outfile << "TileCSR:\n";
+//     outfile << "  mask:\n";
+//     for(int i = 0; i < tileSize; ++i) {
+//         std::bitset<16> val(tile.mask[i]);
+//         outfile << val.to_string().c_str() << " ";
+//         if((i + 1) % tileSize == 0 && i != tileSize - 1) {
+//             outfile << "\n";
+//         }
+//     }
+//     outfile << "\n";
+//     outfile << "  rowPtr:\n";
+//     for(int i = 0; i < tileSize; ++i) {
+//         outfile << static_cast<int>(tile.rowPtr[i]) << " ";
+//     }
+//     outfile << "\n";
+//     outfile << "  rowColIdx:\n";
+//     for(int i = 0; i < tileNnz; ++i) {
+//         // std::bitset<8> val(tile.rowColIdx[i]);
+//         // outfile << val.to_string().c_str() << " ";
+//         auto val = tile.rowColIdx[i];
+//         auto r = val >> 4;
+//         auto c = val & 0xF;
+//         outfile << r << "-" << c << " ";
+//         if((i + 1) % tileSize == 0 && i != tileNnz - 1) {
+//             outfile << "\n";
+//         }
+//     }
+//     outfile << "\n";
+//     outfile << "  vals:\n";
+//     for(int i = 0; i < tileNnz; ++i) {
+//         outfile << tile.vals[i] << " ";
+//         if((i + 1) % tileSize == 0 && i != tileNnz - 1) {
+//             outfile << "\n";
+//         }
+//     }
+//     outfile << "\n\n";
+// }
+
+template<typename ValueType, int tileSize = 16>
+void printInfo(
+    std::ofstream &outfile, TileCSR_C_rev<ValueType,tileSize> const &tile, int tileNnz) noexcept
+{
+    outfile << "TileCSR_C_rev:\n";
+    outfile << "  mask:\n";
+    for(int i = 0; i < tileSize/2; ++i) {
+        unsigned masq = tile.mask[i];
+        std::bitset<16> val(masq >> 16);
+        outfile << val.to_string().c_str() << "\n";
+        val = masq;
+        outfile << val.to_string().c_str() << "\n";
+        if((i + 1) % tileSize == 0 && i != tileSize - 1) {
+            outfile << "\n";
+        }
+    }
+    outfile << "\n";
+    outfile << "  rowPtr:\n";
+    for(int i = 0; i < tileSize; ++i) {
+        outfile << static_cast<int>(tile.rowPtr[i]) << " ";
+    }
+    outfile << "\n";
+    // outfile << "  rowColIdx:\n";
+    // for(int i = 0; i < tileNnz; ++i) {
+    //     std::bitset<8> val(tile.rowColIdx[i]);
+    //     outfile << val.to_string().c_str() << " ";
+    //     if((i + 1) % tileSize == 0 && i != tileNnz - 1) {
+    //         outfile << "\n";
+    //     }
+    // }
+    // outfile << "\n";
+    // outfile << "  vals:\n";
+    // for(int i = 0; i < tileNnz; ++i) {
+    //     outfile << tile.vals[i] << " ";
+    //     if((i + 1) % tileSize == 0 && i != tileNnz - 1) {
+    //         outfile << "\n";
+    //     }
+    // }
+    // outfile << "\n\n";
+}
+
 template<typename ValueType, int tileSize>
-void printInfo2(std::ofstream &outfile, TileCSR_C<ValueType,tileSize> const &tile, int tileNnz) noexcept
+void printInfo2(std::ofstream &outfile, TileCSR_C_rev<ValueType,tileSize> const &tile, int tileNnz) noexcept
 {
     outfile << "TileCSR_C:\n";
     outfile << "  mask:\n";
@@ -208,4 +291,42 @@ void printInfo2(std::ofstream &outfile, TileCSR_C<ValueType,tileSize> const &til
         }
     }
     outfile << "\n";
+}
+
+template<int tileSize = 16>
+__device__
+__forceinline__
+void __tile16x16_transpose_sync(auto &warp, auto *tile) 
+{
+    typename std::remove_pointer<decltype(tile)>::type my_data[2][4];
+
+    int my_data_start[2];
+    my_data_start[0] = warp.thread_rank() / 4 * (tileSize) + warp.thread_rank() * (tileSize / 4);
+    my_data_start[1] = my_data_start[0] + 2;
+
+    #pragma unroll
+    for(int n = 0; n < 2; ++n) {
+        int my_data_start_y = my_data_start[n] / tileSize;
+        int my_data_start_x = my_data_start[n] % tileSize;
+        
+        
+        my_data[n][0] = tile[my_data_start_y * tileSize + my_data_start_x + 0];
+        my_data[n][1] = tile[my_data_start_y * tileSize + my_data_start_x + 1]; 
+        my_data[n][2] = tile[(my_data_start_y + 1) * tileSize + my_data_start_x + 0]; 
+        my_data[n][3] = tile[(my_data_start_y + 1) * tileSize + my_data_start_x + 1]; 
+    }
+
+    #pragma unroll
+    for(int n = 0; n < 2; ++n) {
+        int my_data_start_y = my_data_start[n] / tileSize;
+        int my_data_start_x = my_data_start[n] % tileSize;
+        
+        
+        tile[my_data_start_x * tileSize + my_data_start_y + 0] = my_data[n][0];
+        tile[my_data_start_x * tileSize + my_data_start_y + 1] = my_data[n][2];
+        tile[(my_data_start_x + 1) * tileSize + my_data_start_y + 0] = my_data[n][1];
+        tile[(my_data_start_x + 1) * tileSize + my_data_start_y + 1] = my_data[n][3];
+    }
+
+    warp.sync();
 }

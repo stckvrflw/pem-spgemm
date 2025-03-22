@@ -6,6 +6,7 @@ Original idea from [1]
 
 A Sparse General Matrix-Matrix Multiplication (SpGEMM) implementation.  
 Implemented it my own way from scratch with custom optimization and changes in CUDA C++20.
+Makes extensive use of cooperative groups.
 
 Libraries used:
 * [cx.h][ansorge]
