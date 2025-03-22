@@ -689,7 +689,7 @@ void __multiply_default_sync(
             unsigned current_Cmask = warp.shfl(C_mask, r);
             if(__popc(current_Cmask) == 0) continue;
 
-            ValueType my_sum {};
+            // ValueType my_sum {};
             ValueType my_elem {};
             
             if(lgmgr == 0) {
@@ -732,12 +732,13 @@ void __multiply_default_sync(
                 row_sum += local_group.shfl_down(row_sum, 4);      
                 row_sum += local_group.shfl_down(row_sum, 8);      
                 row_sum = warp.shfl(row_sum, 0);    
-                if(lgmgr == 0 && lgtr == c) my_sum = row_sum;
+                if(lgmgr == 0 && lgtr == c) atomicAdd(&tileC->vals[C_curr_counter+(n-1)], row_sum);
                 } 
                 else {
                 auto fma_buf = reinterpret_cast<ValueType*>(myWarp_buffer);
                 *(fma_buf + warp.thread_rank()) = my_elem;
                 if(lgmgr == 0 && lgtr == c) {
+                    ValueType my_sum {};
                     #pragma unroll
                     for(int i = 0; i < 16; ++i) 
                     my_sum += fma_buf[i] * fma_buf[i + 16];
