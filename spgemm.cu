@@ -22,6 +22,8 @@ Author: Petrus E. Manurung
 #include <thrust/partition.h>
 #include <thrust/iterator/transform_iterator.h>
 
+#include <cub/block/block_scan.cuh>
+
 #include <cusparse.h>
 
 #include <rmm/mr/device/cuda_async_memory_resource.hpp>
@@ -119,6 +121,7 @@ generate_tiles_csr
 
     auto grid = cg::this_grid();
     auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
     auto tid = block.thread_rank();
 
     unsigned block_id = grid.block_rank();
@@ -178,23 +181,21 @@ generate_tiles_csr
         int tile_offset = perTileNnz[block_id];
 
         if(block.thread_rank() == 0) {
-            temp_buffer[0] = 0; // reuse temp_buffer[0] as a counter
             d_tiles[block_d_tiles_offset].vals = d_tiles_vals + tile_offset;
             d_tiles[block_d_tiles_offset].rowColIdx = d_tiles_rowColIdx + tile_offset;
         }
         block.sync();
 
-        for(int t = 0; t < block.size(); ++t) {
-            if(tid == t && thread_val != 0) {
-                d_tiles[block_d_tiles_offset].vals[temp_buffer[0]] = thread_val;
-                d_tiles[block_d_tiles_offset].rowColIdx[temp_buffer[0]] = my_RowColIdx;
-                // d_tiles_vals[tile_offset + temp_buffer[0]] = thread_val;
-                // d_tiles_rowColIdx[tile_offset + temp_buffer[0]] = my_RowColIdx;
-                ++temp_buffer[0];
-            }
-            block.sync();
+        int my_loc = (thread_val != 0) ? 1 : 0;
+        using BlockScan = cub::BlockScan<int, 256>;
+        __shared__ typename BlockScan::TempStorage temp_storage;
+        BlockScan(temp_storage).ExclusiveSum(my_loc, my_loc);
+
+        if(thread_val != (ValueType)0)
+        {
+            d_tiles[block_d_tiles_offset].vals[my_loc] = thread_val;
+            d_tiles[block_d_tiles_offset].rowColIdx[my_loc] = my_RowColIdx;
         }
-        
 
         block_id += grid.num_blocks();
     }
@@ -656,24 +657,36 @@ void __multiply_default_sync(
             if( my_val != 0 && my_a == ((C_rowColIdx >> (4 * (lgmgr ^ 0x1))) & 0xFU) )
             {
                 auto coalesced = cg::coalesced_threads();
-                auto fma_buf = reinterpret_cast<ValueType*>(myWarp_buffer);
 
                 unsigned match_mask = ((1 << my_b) << (16 * lgmgr));
                 match_mask = cg::reduce(coalesced, match_mask, cg::bit_or<unsigned>());
                 match_mask = (match_mask >> 16) & (match_mask & 0xFFFF);
-                int n = 0;
                 if((1 << my_b) & match_mask)
                 {
                     auto matched = cg::coalesced_threads();
-                    n = matched.num_threads()/2;
-                    fma_buf[matched.thread_rank()] = my_val;
-                }
-                coalesced.sync();
-                if(coalesced.thread_rank() == 0)
-                {
-                    ValueType sum {};
-                    for(int i = 0; i < n; ++i) sum += fma_buf[i] * fma_buf[n+i];
-                    atomicAdd(&tileC->vals[C_idx], sum);
+                    int n = matched.num_threads()/2;
+                    if(n == 16)
+                    {
+                        ValueType row_sum = matched.shfl_down(my_val, 16);
+                        row_sum *= my_val;
+                        row_sum += matched.shfl_down(row_sum, 1);            
+                        row_sum += matched.shfl_down(row_sum, 2);      
+                        row_sum += matched.shfl_down(row_sum, 4);      
+                        row_sum += matched.shfl_down(row_sum, 8);      
+                        if(matched.thread_rank() == 0) atomicAdd(&tileC->vals[C_idx], row_sum);
+                    }
+                    else 
+                    {
+                        auto fma_buf = reinterpret_cast<ValueType*>(myWarp_buffer);
+                        fma_buf[matched.thread_rank()] = my_val;
+                        matched.sync();
+                        if(matched.thread_rank() == 0)
+                        {
+                            ValueType sum{};
+                            for(int i = 0; i < n; ++i) sum += fma_buf[i] * fma_buf[n+i];
+                            atomicAdd(&tileC->vals[C_idx], sum);
+                        }
+                    }
                 }
             }
             warp.sync();
@@ -748,10 +761,6 @@ void __multiply_default_sync(
             }
             C_curr_counter += __popc(current_Cmask);
             warp.sync();
-
-            // store
-            // if(lgmgr == 0 && my_sum != 0) atomicAdd(&tileC->vals[r * tileSize + lgtr], my_sum);
-            // warp.sync();
         }
     }
 }
@@ -789,8 +798,9 @@ multiply_pairs
     auto warp_load_tile_lambda = [](auto const &halfwarp, auto *tile, auto *halfwarp_tiles_start) __attribute__((always_inline)) 
     {
         int local_rank = halfwarp.thread_rank();
-        if(local_rank == 0 || local_rank == 1)
-        *(reinterpret_cast<ulonglong4*>(halfwarp_tiles_start) + local_rank) = *(reinterpret_cast<ulonglong4 const*>(tile) + local_rank);
+        // if(local_rank == 0 || local_rank == 1)
+        // *(reinterpret_cast<ulonglong4*>(halfwarp_tiles_start) + local_rank) = *(reinterpret_cast<ulonglong4 const*>(tile) + local_rank);
+        *(reinterpret_cast<uchar4*>(halfwarp_tiles_start) + local_rank) = *(reinterpret_cast<uchar4 const*>(tile) + local_rank);
     };
 
     int warp_pairs_idx_start = grid.block_rank() * 4 + warp.meta_group_rank();
@@ -1782,6 +1792,7 @@ int main(int argc, char *argv[]) {
 
     dim3 threads_mp {numThreads_mp};
     dim3 blocks_mp {numBlocksPerSm_mp * deviceProp.multiProcessorCount};
+    // revise later -- multi launch -- dynamic shmem depends on A and B's nnz, to maximize occupancy on each sparsity
     CHECK_CUDA( cudaLaunchCooperativeKernel((void*)multiply_pairs<ValueType>, blocks_mp, threads_mp, kernArgs, sizeof(TileCSR_rev<ValueType>) * 8, STREAM_C) )
 
 #ifdef DEBUG_11
@@ -1843,8 +1854,8 @@ int main(int argc, char *argv[]) {
     cudaStreamSynchronize(STREAM_C);
     std::cout << "C nnz: " << _C_perTileNnz.back() << "\n";
 
-    std::quick_exit(0);
-    // std::atexit([]{cudaDeviceReset();});
+    // std::quick_exit(0);
+    std::atexit([]{cudaDeviceReset();});
     return 0; // <--------------------------------------------------------------------------------------------------------------------------------
 
     // rmm::device_vector<int> Crows(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
