@@ -682,31 +682,34 @@ multiply_pairs_register_cache // lte 16
 {
     using ValType = double;
     __shared__ ValType perWarp_buffer[4 * 32];
+    // __shared__ unsigned warp_mask_cache[4];
 
-    int warp_tr = threadIdx.x % 32;
-    int warp_mgr = threadIdx.x >> 5;
-    int halfwarp_mgr = warp_tr >> 4;
-    int halfwarp_tr = warp_tr % 16;
-    auto halfwarp_tiles = (halfwarp_mgr == 0) ? Atiles : Btiles;
+    // int volatile warp_tr = threadIdx.x % 32;
+    int volatile warp_mgr = threadIdx.x >> 5;
+    // int volatile halfwarp_mgr = warp_tr >> 4;
+    int volatile halfwarp_mgr = (threadIdx.x%32)>>4;
+    // int volatile halfwarp_tr = warp_tr % 16;
+    int volatile halfwarp_tr = (threadIdx.x%32)%16;
+    // auto volatile halfwarp_tiles = (halfwarp_mgr == 0) ? Atiles : Btiles;
 
-    perWarp_buffer[threadIdx.x] = 0;
+    // perWarp_buffer[threadIdx.x] = 0;
 
     int warp_pairs_idx_start = (blockIdx.x << 2) + warp_mgr;
     while(warp_pairs_idx_start < d_pairs_size) 
     {
-        int halfwarp_tile_idx = *(reinterpret_cast<int const*>(&d_pairs[warp_pairs_idx_start]) + (halfwarp_mgr ^ 0x1));
-        int halfwarp_tile_nnz = (halfwarp_mgr == 0) 
+        int volatile halfwarp_tile_idx = *(reinterpret_cast<int const*>(&d_pairs[warp_pairs_idx_start]) + (halfwarp_mgr ^ 0x1));
+        int volatile halfwarp_tile_nnz = (halfwarp_mgr == 0) 
                      ? (_A_perTileNnz[halfwarp_tile_idx+1] - _A_perTileNnz[halfwarp_tile_idx]) 
                      : (_B_perTileNnz[halfwarp_tile_idx+1] - _B_perTileNnz[halfwarp_tile_idx]);
-        auto halfwarp_tile = halfwarp_tiles + halfwarp_tile_idx;
+        auto volatile halfwarp_tile = ((halfwarp_mgr == 0) ? Atiles : Btiles) + halfwarp_tile_idx;
 
-        int warp_tileC_idx = C_targetTiles[warp_pairs_idx_start];
-        TileCSR_C_rev<ValueType> *tileC = Ctiles + warp_tileC_idx;
-        int tileC_nnz = _C_perTileNnz[warp_tileC_idx + 1] - _C_perTileNnz[warp_tileC_idx];
+        int volatile warp_tileC_idx = C_targetTiles[warp_pairs_idx_start];
+        TileCSR_C_rev<ValueType> * volatile tileC = Ctiles + warp_tileC_idx;
+        int volatile tileC_nnz = _C_perTileNnz[warp_tileC_idx + 1] - _C_perTileNnz[warp_tileC_idx];
   
-        ValueType my_val {};
-        uint8_t my_a {};
-        uint8_t my_b {};
+        ValueType volatile my_val {};
+        uint8_t volatile my_a {};
+        uint8_t volatile my_b {};
 
         if(halfwarp_tr <= halfwarp_tile_nnz) 
         {
@@ -716,23 +719,23 @@ multiply_pairs_register_cache // lte 16
         }
         __syncwarp();
         
-        int C_idx = 0;
+        int volatile C_idx = 0;
         while(C_idx < tileC_nnz)
         {
             uint8_t C_rowColIdx = tileC->rowColIdx[C_idx];
 
             if( my_val != 0 && my_a == ((C_rowColIdx >> ((halfwarp_mgr ^ 0x1)<<2)) & 0xFU) )
             {
-                auto coalesced = cg::coalesced_threads();
+                // auto coalesced = cg::coalesced_threads();
 
                 unsigned match_mask = ((1 << my_b) << (halfwarp_mgr<<4));
-                match_mask = cg::reduce(coalesced, match_mask, cg::bit_or<unsigned>());
+                match_mask = cg::reduce(cg::coalesced_threads(), match_mask, cg::bit_or<unsigned>());
                 match_mask = (match_mask >> 16) & (match_mask & 0xFFFF);
                 if((1 << my_b) & match_mask)
                 {
                     auto matched = cg::coalesced_threads();
-                    int n = matched.num_threads()>>1;
-                    if(n == 16)
+                    int volatile n = matched.num_threads()>>1; // strange register usage per thread here without volatile(40->53)
+                    if(n == 16) [[unlikely]]
                     {
                         ValueType row_sum = my_val * matched.shfl_down(my_val, 16);
                         row_sum += matched.shfl_down(row_sum, 1);            
@@ -741,7 +744,7 @@ multiply_pairs_register_cache // lte 16
                         row_sum += matched.shfl_down(row_sum, 8);      
                         if(matched.thread_rank() == 0) atomicAdd(&tileC->vals[C_idx], row_sum);
                     }
-                    else 
+                    else [[likely]]
                     {
                         perWarp_buffer[(warp_mgr<<5)+matched.thread_rank()] = my_val;
                         matched.sync();
@@ -758,7 +761,8 @@ multiply_pairs_register_cache // lte 16
             ++C_idx;
         }
 
-        warp_pairs_idx_start += gridDim.x * (blockDim.x >> 5);
+        // warp_pairs_idx_start += gridDim.x * (blockDim.x >> 5);
+        warp_pairs_idx_start += (gridDim.x << 2);
     }
 }
 
@@ -938,9 +942,9 @@ multiply_pairs_tensor // gt 192
 
     block_init_shmem_sync();
 
-    int tile = threadIdx.x >> 5;
-    int warp_tid = threadIdx.x % 32;
-    int block_pairs_idx_start = blockIdx.x;
+    int volatile tile = threadIdx.x >> 5;
+    int volatile warp_tid = threadIdx.x % 32;
+    int volatile block_pairs_idx_start = blockIdx.x;
     while(block_pairs_idx_start < d_pairs_size)
     {
         int A_idx = d_pairs[block_pairs_idx_start] >> 32;
@@ -961,7 +965,6 @@ multiply_pairs_tensor // gt 192
         {
             a = tileA[row_offset+(warp_tid>>2)][(warp_tid%4)+(n<<2)];
             b = tileB[(warp_tid%4)+(n<<2)][col_offset+(warp_tid>>2)];
-            __syncwarp();
 
             asm volatile("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 { %0, %1 }, {%2}, {%3}, { %4, %5 };" : "=d"(c.x), "=d"(c.y) : "d"(a), "d"(b), "d"(c.x), "d"(c.y));
         }
@@ -2218,7 +2221,7 @@ int main(int argc, char *argv[]) {
             case 1:
             {
                 dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
-                multiply_pairs_default<ValueType, 32><<<blocks_mp, threads_mp, sizeof(ValueType) * 4 * 2 * 32 + 1, STREAM_C>>>
+                multiply_pairs_default<ValueType, 32><<<blocks_mp, threads_mp, sizeof(ValueType) * 4 * 2 * 32 + 1, STREAM_A>>>
                 (
                     d_pairs.data().get() + d_pairs_tag_offset[i],
                     d_pairs_size,
@@ -2237,7 +2240,7 @@ int main(int argc, char *argv[]) {
             case 2:
             {
                 dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
-                multiply_pairs_default<ValueType, 64><<<blocks_mp, threads_mp, sizeof(ValueType) * 4 * 2 * 64 + 1, STREAM_C>>>
+                multiply_pairs_default<ValueType, 64><<<blocks_mp, threads_mp, sizeof(ValueType) * 4 * 2 * 64 + 1, STREAM_B>>>
                 (
                     d_pairs.data().get() + d_pairs_tag_offset[i],
                     d_pairs_size,
@@ -2256,7 +2259,7 @@ int main(int argc, char *argv[]) {
             case 3:
             {
                 dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
-                multiply_pairs_default<ValueType, 128><<<blocks_mp, threads_mp, sizeof(ValueType) * 4 * 2 * 128 + 1, STREAM_C>>>
+                multiply_pairs_default<ValueType, 128><<<blocks_mp, threads_mp, sizeof(ValueType) * 4 * 2 * 128 + 1, STREAM_D>>>
                 (
                     d_pairs.data().get() + d_pairs_tag_offset[i],
                     d_pairs_size,
@@ -2275,7 +2278,7 @@ int main(int argc, char *argv[]) {
             case 4:
             {
                 dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
-                multiply_pairs_default<ValueType, 192><<<blocks_mp, threads_mp, sizeof(ValueType) * 4 * 2 * 192 + 1, STREAM_C>>>
+                multiply_pairs_default<ValueType, 192><<<blocks_mp, threads_mp, sizeof(ValueType) * 4 * 2 * 192 + 1, STREAM_E>>>
                 (
                     d_pairs.data().get() + d_pairs_tag_offset[i],
                     d_pairs_size,
@@ -2371,7 +2374,8 @@ int main(int argc, char *argv[]) {
     });
 #endif
 
-    cudaStreamSynchronize(STREAM_C);
+    // cudaStreamSynchronize(STREAM_C);
+    cudaDeviceSynchronize();
     std::cout << "C nnz: " << _C_perTileNnz.back() << "\n";
 
     // std::quick_exit(0);
