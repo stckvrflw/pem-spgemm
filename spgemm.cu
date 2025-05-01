@@ -23,6 +23,7 @@ Author: Petrus E. Manurung
 #include <thrust/iterator/transform_iterator.h>
 
 #include <cub/block/block_scan.cuh>
+#include <cub/warp/warp_merge_sort.cuh>
 
 #include <cusparse.h>
 
@@ -107,8 +108,6 @@ generate_tiles_csr
     r_Ptr<uint8_t> d_tiles_rowColIdx,
     cr_Ptr<long long> participating_tiles,
     cr_Ptr<int> participating_tiles_size,
-    // r_Ptr<int> tilePtr,
-    // r_Ptr<int> tileColIdx,
     r_Ptr<int> perTileNnz,
     cr_Ptr<int> d_J,
     cr_Ptr<ValueType> d_vals,
@@ -478,6 +477,52 @@ search_pairs
     }
 }
 
+__global__ void __launch_bounds__(128)
+tag_pairs
+(
+    r_Ptr<uint8_t> d_pairs_tag,
+    int d_pairs_tag_size,
+    cr_Ptr<long long> d_pairs,
+    cr_Ptr<int> A_perTileNnz,
+    cr_Ptr<int> B_perTileNnz
+)
+{
+    auto warp = cg::tiled_partition<32>(cg::this_thread_block());
+
+    auto compare = [](int A_nnz, int B_nnz) __attribute__((always_inline))
+    {
+        // if(A_nnz <= 16 && B_nnz <= 16) return 0;
+        // else if(A_nnz <= 192 && B_nnz <= 192) return 1;
+        // return 2;
+        int m = max(A_nnz, B_nnz);
+        if(m <= 16) return 0;
+        if(m <= 32) return 1;
+        if(m <= 64) return 2;
+        if(m <= 128) return 3;
+        if(m <= 192) return 4;
+        return 5; // treat as dense
+    };
+
+    int thread_start = cg::this_grid().thread_rank();
+    while(thread_start < d_pairs_tag_size)
+    {
+        int a = (d_pairs[thread_start] >> 32);
+        int b = (d_pairs[thread_start] & 0xFFFFFFFF);
+        int curr_A_perTileNnz = A_perTileNnz[a+1] - A_perTileNnz[a];
+        int curr_B_perTileNnz = B_perTileNnz[b+1] - B_perTileNnz[b];
+
+        // curr_d_pairs_tag.w = compare(curr_A_perTileNnz.w, curr_B_perTileNnz.w);
+        // curr_d_pairs_tag.x = compare(curr_A_perTileNnz.x, curr_B_perTileNnz.x);
+        // curr_d_pairs_tag.y = compare(curr_A_perTileNnz.y, curr_B_perTileNnz.y);
+        // curr_d_pairs_tag.z = compare(curr_A_perTileNnz.z, curr_B_perTileNnz.z);
+        
+        // *(reinterpret_cast<uchar4*>(&d_pairs_tag[thread_start])) = curr_d_pairs_tag;
+
+        d_pairs_tag[thread_start] = compare(curr_A_perTileNnz, curr_B_perTileNnz);
+        thread_start += cg::this_grid().num_threads();
+    }
+}
+
 template<typename ValueType, int tileSize = 16>
 __global__ void __launch_bounds__(4 * 32) 
 allocate_C
@@ -613,6 +658,331 @@ C_setOffsets
         }
 
         local_group_Ctiles_idx_start += grid.num_blocks() * block.num_threads() / local_group.size();
+    }
+}
+
+template<typename ValueType, int tileSize = 16>
+__global__ void 
+__launch_bounds__(tileSize * tileSize / 2)
+multiply_pairs_register_cache // lte 16
+(
+    cr_Ptr<long long> d_pairs,
+    int d_pairs_size,
+    
+    r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
+    r_Ptr<int> _C_perTileNnz,
+    cr_Ptr<int> C_targetTiles,
+
+    cr_Ptr<TileCSR_rev<ValueType,tileSize>> Atiles,
+    cr_Ptr<int> _A_perTileNnz,
+
+    cr_Ptr<TileCSR_rev<ValueType,tileSize>> Btiles,
+    cr_Ptr<int> _B_perTileNnz
+)
+{
+    using ValType = double;
+    __shared__ ValType perWarp_buffer[4 * 32];
+
+    int warp_tr = threadIdx.x % 32;
+    int warp_mgr = threadIdx.x >> 5;
+    int halfwarp_mgr = warp_tr >> 4;
+    int halfwarp_tr = warp_tr % 16;
+    auto halfwarp_tiles = (halfwarp_mgr == 0) ? Atiles : Btiles;
+
+    perWarp_buffer[threadIdx.x] = 0;
+
+    int warp_pairs_idx_start = (blockIdx.x << 2) + warp_mgr;
+    while(warp_pairs_idx_start < d_pairs_size) 
+    {
+        int halfwarp_tile_idx = *(reinterpret_cast<int const*>(&d_pairs[warp_pairs_idx_start]) + (halfwarp_mgr ^ 0x1));
+        int halfwarp_tile_nnz = (halfwarp_mgr == 0) 
+                     ? (_A_perTileNnz[halfwarp_tile_idx+1] - _A_perTileNnz[halfwarp_tile_idx]) 
+                     : (_B_perTileNnz[halfwarp_tile_idx+1] - _B_perTileNnz[halfwarp_tile_idx]);
+        auto halfwarp_tile = halfwarp_tiles + halfwarp_tile_idx;
+
+        int warp_tileC_idx = C_targetTiles[warp_pairs_idx_start];
+        TileCSR_C_rev<ValueType> *tileC = Ctiles + warp_tileC_idx;
+        int tileC_nnz = _C_perTileNnz[warp_tileC_idx + 1] - _C_perTileNnz[warp_tileC_idx];
+  
+        ValueType my_val {};
+        uint8_t my_a {};
+        uint8_t my_b {};
+
+        if(halfwarp_tr <= halfwarp_tile_nnz) 
+        {
+            my_val = halfwarp_tile->vals[halfwarp_tr];
+            my_a = ((halfwarp_tile->rowColIdx[halfwarp_tr] >> ((halfwarp_mgr ^ 0x1)<<2)) & 0xFU);
+            my_b = ((halfwarp_tile->rowColIdx[halfwarp_tr] >> ((halfwarp_mgr)<<2)) & 0xFU);
+        }
+        __syncwarp();
+        
+        int C_idx = 0;
+        while(C_idx < tileC_nnz)
+        {
+            uint8_t C_rowColIdx = tileC->rowColIdx[C_idx];
+
+            if( my_val != 0 && my_a == ((C_rowColIdx >> ((halfwarp_mgr ^ 0x1)<<2)) & 0xFU) )
+            {
+                auto coalesced = cg::coalesced_threads();
+
+                unsigned match_mask = ((1 << my_b) << (halfwarp_mgr<<4));
+                match_mask = cg::reduce(coalesced, match_mask, cg::bit_or<unsigned>());
+                match_mask = (match_mask >> 16) & (match_mask & 0xFFFF);
+                if((1 << my_b) & match_mask)
+                {
+                    auto matched = cg::coalesced_threads();
+                    int n = matched.num_threads()>>1;
+                    if(n == 16)
+                    {
+                        ValueType row_sum = my_val * matched.shfl_down(my_val, 16);
+                        row_sum += matched.shfl_down(row_sum, 1);            
+                        row_sum += matched.shfl_down(row_sum, 2);      
+                        row_sum += matched.shfl_down(row_sum, 4);      
+                        row_sum += matched.shfl_down(row_sum, 8);      
+                        if(matched.thread_rank() == 0) atomicAdd(&tileC->vals[C_idx], row_sum);
+                    }
+                    else 
+                    {
+                        perWarp_buffer[(warp_mgr<<5)+matched.thread_rank()] = my_val;
+                        matched.sync();
+                        if(matched.thread_rank() == 0)
+                        {
+                            ValueType sum{};
+                            for(int i = 0; i < n; ++i) sum += perWarp_buffer[(warp_mgr<<5)+i] * perWarp_buffer[(warp_mgr<<5)+n+i];
+                            atomicAdd(&tileC->vals[C_idx], sum);
+                        }
+                    }
+                }
+            }
+            __syncwarp();
+            ++C_idx;
+        }
+
+        warp_pairs_idx_start += gridDim.x * (blockDim.x >> 5);
+    }
+}
+
+template<typename ValueType, int S, int tileSize = 16>
+__global__ void 
+__launch_bounds__(tileSize * tileSize / 2)
+multiply_pairs_default // gt 16 lte 64 lte 96 lte 128 lte 192
+(
+    cr_Ptr<long long> d_pairs,
+    int d_pairs_size,
+    
+    r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
+    r_Ptr<int> _C_perTileNnz,
+    cr_Ptr<int> C_targetTiles,
+
+    cr_Ptr<TileCSR_rev<ValueType,tileSize>> Atiles,
+    cr_Ptr<int> _A_perTileNnz,
+
+    cr_Ptr<TileCSR_rev<ValueType,tileSize>> Btiles,
+    cr_Ptr<int> _B_perTileNnz
+)
+{
+    using IdxType = uint8_t;
+    using MaskType = uint16_t;
+    using ValType = double;
+
+    extern __shared__ ValType warp_tile_vals[];
+    __shared__ MaskType warp_tile_mask      [4][2][16];
+    __shared__ MaskType warp_elems_mask     [4][256];
+    __shared__ IdxType warp_tileC_rowColIdx [4][256];
+
+    auto grid = cg::this_grid();
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
+    auto halfwarp = cg::tiled_partition<16>(warp);
+    auto halfwarp_tile = halfwarp.meta_group_rank() == 0 ? Atiles : Btiles;    
+
+    int warp_pairs_idx_start = (grid.block_rank() << 2) + warp.meta_group_rank();
+    while(warp_pairs_idx_start < d_pairs_size)
+    {
+        int warp_tileC_idx = C_targetTiles[warp_pairs_idx_start];
+        TileCSR_C_rev<ValueType> *tileC = Ctiles + warp_tileC_idx;
+        int tileC_nnz = _C_perTileNnz[warp_tileC_idx + 1] - _C_perTileNnz[warp_tileC_idx];
+
+        int halfwarp_tile_idx = *(reinterpret_cast<int const*>(&d_pairs[warp_pairs_idx_start]) + (halfwarp.meta_group_rank() ^ 0x1));
+        int halfwarp_tile_nnz = (halfwarp.meta_group_rank() == 0) 
+                            ? (_A_perTileNnz[halfwarp_tile_idx+1] - _A_perTileNnz[halfwarp_tile_idx]) 
+                            : (_B_perTileNnz[halfwarp_tile_idx+1] - _B_perTileNnz[halfwarp_tile_idx]);
+
+        for(int n = halfwarp.thread_rank(); n < halfwarp_tile_nnz; n+=halfwarp.num_threads())
+        {
+            if constexpr(S == 32)   warp_tile_vals[(warp.meta_group_rank() << 6) + (halfwarp.meta_group_rank() << 5) + n] = halfwarp_tile[halfwarp_tile_idx].vals[n];
+            else if (S == 64)       warp_tile_vals[(warp.meta_group_rank() << 7) + (halfwarp.meta_group_rank() << 6) + n] = halfwarp_tile[halfwarp_tile_idx].vals[n];
+            else if (S == 128)      warp_tile_vals[(warp.meta_group_rank() << 8) + (halfwarp.meta_group_rank() << 7) + n] = halfwarp_tile[halfwarp_tile_idx].vals[n];
+            else /* S == 192 */     warp_tile_vals[(warp.meta_group_rank() * 384) + (halfwarp.meta_group_rank() * 192) + n] = halfwarp_tile[halfwarp_tile_idx].vals[n];
+        }
+
+        for(int i = warp.thread_rank(); i < tileC_nnz; i += warp.num_threads())
+        {
+            warp_tileC_rowColIdx[warp.meta_group_rank()][i] = tileC->rowColIdx[i];
+        }
+
+        if(halfwarp.thread_rank() == 0)
+        {
+            *(reinterpret_cast<ulonglong4*>(&warp_tile_mask[warp.meta_group_rank()][halfwarp.meta_group_rank()])) 
+            = 
+            *(reinterpret_cast<ulonglong4 const*>(&halfwarp_tile[halfwarp_tile_idx].mask));
+        }
+        warp.sync();
+
+        unsigned thread_mask = warp_tile_mask[warp.meta_group_rank()][halfwarp.meta_group_rank() ^ 0x1][halfwarp.thread_rank()];
+        // tranpose tile B's mask
+        if(halfwarp.meta_group_rank() == 1)
+        {
+            thread_mask = 0;
+            #pragma unroll
+            for(int r = 0; r < 16; ++r)
+            thread_mask |= (((warp_tile_mask[warp.meta_group_rank()][1][r] >> halfwarp.thread_rank()) & 0x1) << r);
+            warp_tile_mask[warp.meta_group_rank()][1][halfwarp.thread_rank()] = thread_mask;
+        }
+        warp.sync();
+
+        // calculate elements mask
+        for(int n = warp.thread_rank(); n < tileC_nnz; n+=warp.num_threads()) 
+        {
+            int r = warp_tileC_rowColIdx[warp.meta_group_rank()][n] >> 4;
+            int c = warp_tileC_rowColIdx[warp.meta_group_rank()][n] & 0xF;
+            warp_elems_mask[warp.meta_group_rank()][n] = warp_tile_mask[warp.meta_group_rank()][0][r] & warp_tile_mask[warp.meta_group_rank()][1][c];
+        }
+        warp.sync();
+        if(halfwarp.meta_group_rank() == 0) warp_tile_mask[warp.meta_group_rank()][1][halfwarp.thread_rank()] = thread_mask;
+        warp.sync();
+
+        int A = *(reinterpret_cast<int const*>(&d_pairs[warp_pairs_idx_start])+1);
+        int B = *(reinterpret_cast<int const*>(&d_pairs[warp_pairs_idx_start]));
+        // calculate C
+        for(int n = warp.thread_rank(); n < tileC_nnz; n+=warp.num_threads())
+        {
+            ValType sum = 0;
+            int r = warp_tileC_rowColIdx[warp.meta_group_rank()][n] >> 4;
+            int c = warp_tileC_rowColIdx[warp.meta_group_rank()][n] & 0xF;
+            unsigned my_mask = warp_elems_mask[warp.meta_group_rank()][n];
+            while(my_mask)
+            {
+                int A_offset = __popc( warp_tile_mask[warp.meta_group_rank()][0][r] & (0xFFFF >> (17-__ffs(my_mask))) );
+                int B_offset = __popc( warp_tile_mask[warp.meta_group_rank()][1][__ffs(my_mask)-1] & (0xFFFF >> (17-c)) );
+                if constexpr(S == 32)
+                sum += warp_tile_vals[(warp.meta_group_rank() << 6) + Atiles[A].rowPtr[r]+A_offset] * warp_tile_vals[(warp.meta_group_rank() << 6) + 32 + Btiles[B].rowPtr[__ffs(my_mask)-1]+B_offset];
+                else if(S == 64)
+                sum += warp_tile_vals[(warp.meta_group_rank() << 7) + Atiles[A].rowPtr[r]+A_offset] * warp_tile_vals[(warp.meta_group_rank() << 7) + 64 + Btiles[B].rowPtr[__ffs(my_mask)-1]+B_offset];
+                else if(S == 128)
+                sum += warp_tile_vals[(warp.meta_group_rank() << 8) + Atiles[A].rowPtr[r]+A_offset] * warp_tile_vals[(warp.meta_group_rank() << 8) + 128 + Btiles[B].rowPtr[__ffs(my_mask)-1]+B_offset];
+                else
+                sum += warp_tile_vals[(warp.meta_group_rank() * 384) + Atiles[A].rowPtr[r]+A_offset] * warp_tile_vals[(warp.meta_group_rank() * 384) + 192 + Btiles[B].rowPtr[__ffs(my_mask)-1]+B_offset];
+                my_mask &= (~(1 << (__ffs(my_mask)-1)));
+            }
+            atomicAdd(&tileC->vals[n], sum);
+        }
+
+        // warp_pairs_idx_start += grid.num_blocks() * block.num_threads() / warp.size();
+        // warp_pairs_idx_start += grid.num_blocks() * (block.num_threads() >> 5);
+        warp_pairs_idx_start += (grid.num_blocks() << 2);
+    }
+}
+
+template<typename ValueType, int tileSize = 16>
+__global__ void 
+__launch_bounds__(128)// 4 warps
+multiply_pairs_tensor // gt 192
+(
+    cr_Ptr<long long> d_pairs,
+    int d_pairs_size,
+    
+    r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
+    r_Ptr<int> _C_perTileNnz,
+    cr_Ptr<int> C_targetTiles,
+
+    cr_Ptr<TileCSR_rev<ValueType,tileSize>> Atiles,
+    cr_Ptr<int> _A_perTileNnz,
+
+    cr_Ptr<TileCSR_rev<ValueType,tileSize>> Btiles,
+    cr_Ptr<int> _B_perTileNnz
+)
+{
+    using ValType = double;
+    __shared__ ValType tileA[16][16+1]; // +1 to avoid bank conflict
+    __shared__ ValType tileB[16][16+1];
+    __shared__ ValType tileC[16][16+1];
+
+    auto block_copy_shmem_sync = [&](int A_idx, int B_idx) __attribute__((always_inline)){
+        for(int n = threadIdx.x; n < _A_perTileNnz[A_idx+1]-_A_perTileNnz[A_idx]; ++n)
+        {
+            int r = Atiles[A_idx].rowColIdx[n] >> 4;
+            int c = Atiles[A_idx].rowColIdx[n] & 0xF;
+            tileA[r][c] = Atiles[A_idx].vals[n];
+        }
+        for(int n = threadIdx.x; n < _B_perTileNnz[B_idx+1]-_B_perTileNnz[B_idx]; ++n)
+        {
+            int r = Btiles[B_idx].rowColIdx[n] >> 4;
+            int c = Btiles[B_idx].rowColIdx[n] & 0xF;
+            tileB[r][c] = Btiles[B_idx].vals[n];
+        }
+
+        __syncthreads();
+    };
+
+    auto block_init_shmem_sync = [&] __attribute__((always_inline)) {
+        #pragma unroll
+        for(int n = threadIdx.x; n < 256; n+=128)
+        {
+            int shr = n>>4;
+            int shc = n%16;
+            tileC[shr][shc] = tileA[shr][shc] = tileB[shr][shc] = 0;
+        }
+        __syncthreads();
+    };
+
+    block_init_shmem_sync();
+
+    int tile = threadIdx.x >> 5;
+    int warp_tid = threadIdx.x % 32;
+    int block_pairs_idx_start = blockIdx.x;
+    while(block_pairs_idx_start < d_pairs_size)
+    {
+        int A_idx = d_pairs[block_pairs_idx_start] >> 32;
+        int B_idx = d_pairs[block_pairs_idx_start] & 0xFFFFFFFF;
+        block_copy_shmem_sync(A_idx, B_idx);
+
+        double a {}, b {};
+        double2 c {};
+
+        c.x = 0;
+        c.y = 0;
+
+        int row_offset = (tile >> 1) << 3;
+        int col_offset = (tile % 2) << 3;
+
+        #pragma unroll
+        for(int n = 0; n < (16/4); ++n)
+        {
+            a = tileA[row_offset+(warp_tid>>2)][(warp_tid%4)+(n<<2)];
+            b = tileB[(warp_tid%4)+(n<<2)][col_offset+(warp_tid>>2)];
+            __syncwarp();
+
+            asm volatile("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 { %0, %1 }, {%2}, {%3}, { %4, %5 };" : "=d"(c.x), "=d"(c.y) : "d"(a), "d"(b), "d"(c.x), "d"(c.y));
+        }
+
+        int row = warp_tid >> 2;
+        int col1 = ((warp_tid % 4) << 1);
+        int col2 = ((warp_tid % 4) << 1) + 1;
+
+        tileC[row_offset + row][col_offset + col1] = c.x;
+        tileC[row_offset + row][col_offset + col2] = c.y;
+        __syncthreads();
+
+        int block_tileC_idx = C_targetTiles[block_pairs_idx_start];
+        TileCSR_C_rev<ValueType> *our_tileC = Ctiles + block_tileC_idx;
+        int tileC_nnz = _C_perTileNnz[block_tileC_idx + 1] - _C_perTileNnz[block_tileC_idx];
+
+        for(int t = threadIdx.x; t < tileC_nnz; t+=blockDim.x)
+        atomicAdd(&our_tileC->vals[t], tileC[(our_tileC->rowColIdx[t])>>4][(our_tileC->rowColIdx[t])&0xF]);
+
+        block_init_shmem_sync();
+        block_pairs_idx_start += gridDim.x;
     }
 }
 
@@ -939,6 +1309,7 @@ enum STREAMS {
 // #define DEBUG_9
 // #define DEBUG_10
 // #define DEBUG_11
+// #define DEBUG_12
 
 int main(int argc, char *argv[]) {
     if(argc <= 1 || argc > 3) {
@@ -1571,7 +1942,7 @@ int main(int argc, char *argv[]) {
     });
 #endif
 
-    std::cout << "\nSPECULATING PAIRS\n";
+    std::cout << "\nCOUNTING PAIRS\n";
 
     int numBlocksPerSm_sp = 0;
     int numThreads_sp = 256;
@@ -1629,6 +2000,7 @@ int main(int argc, char *argv[]) {
     cudaStreamSynchronize(STREAM_C);
     rmm::device_vector<long long> d_pairs(*pairs_count, SPGEMM_STREAM_ALLOCATOR_LONGLONG(STREAM_C));
     rmm::device_vector<int> C_targetTile(*pairs_count, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
+    rmm::device_vector<uint8_t> d_pairs_tag(*pairs_count, SPGEMM_STREAM_ALLOCATOR_UINT8(STREAM_C));
     std::cout << "FIRST PASS pairs count: " << *pairs_count << "\n";
     // second pass
     ptr1 = d_pairs.data().get();
@@ -1636,6 +2008,7 @@ int main(int argc, char *argv[]) {
     kern_args[0] = static_cast<void*>(&ptr1);
     kern_args[1] = static_cast<void*>(&ptr2);
     cudaMemsetAsync(pairs_count, 0, sizeof(int), STREAM_C);
+    // blocks_sp.x = 7; // DELETE LATER
     CHECK_CUDA( cudaLaunchCooperativeKernel((void*)search_pairs<1>, blocks_sp, threads_sp, kern_args, 0, STREAM_C) )
 
 #ifdef DEBUG_9
@@ -1687,6 +2060,57 @@ int main(int argc, char *argv[]) {
     });
 #endif
 
+    // tag pairs, 0 -> register cache, 1 -> < 192, usual, 2 -> > 192, dense, use tensor cores
+    dim3 threads_tp {128};
+    dim3 blocks_tp {(d_pairs_tag.size()-1+threads_tp.x)/threads_tp.x};
+    tag_pairs<<<blocks_tp, threads_tp, 0, STREAM_C>>>
+    (
+        d_pairs_tag.data().get(), 
+        d_pairs_tag.size(), 
+        d_pairs.data().get(), 
+        A_perTileNnz.data().get(), 
+        B_perTileNnz.data().get()
+    );
+
+    rmm::device_vector<int> d_pairs_tag_keys(6, -1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
+    rmm::device_vector<int> d_pairs_tag_offset(7, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
+    {
+        auto zit = thrust::make_zip_iterator(thrust::make_tuple(d_pairs.begin(), C_targetTile.begin()));
+        thrust::stable_sort_by_key(ASYNC_EXEC_POLICY(STREAM_C), d_pairs_tag.begin(), d_pairs_tag.end(), zit);
+        // auto zit = thrust::make_zip_iterator(thrust::make_tuple(d_pairs_tag.begin(), d_pairs.begin(), C_targetTile.begin()));
+        // thrust::stable_sort(ASYNC_EXEC_POLICY(STREAM_C), zit, zit + d_pairs_tag.size());
+        thrust::reduce_by_key(ASYNC_EXEC_POLICY(STREAM_C), d_pairs_tag.begin(), d_pairs_tag.end(), thrust::make_constant_iterator<int>(1), d_pairs_tag_keys.begin(), d_pairs_tag_offset.begin());
+        thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_C), d_pairs_tag_offset.begin(), d_pairs_tag_offset.end(), d_pairs_tag_offset.begin());
+    }
+
+#ifdef DEBUG_12
+    std::jthread DEBUG_12([&]{
+        cudaStreamSynchronize(STREAM_C);
+        char const *filename = "../src/DEBUG/DEBUG_12";
+        std::ofstream outfile;
+        outfile.open(filename, std::ios::out);
+
+        outfile << "DEBUG 12\n";
+
+        outfile << "KEYS\n";
+        // for(auto i = d_pairs_tag_keys.begin(); i < d_pairs_newend.first; ++i) outfile << *i << "\n";
+        for(int i = 0; i < 6; ++i) outfile << d_pairs_tag_keys[i] << "\n";
+        outfile << "COUNTS\n";
+        // for(auto i = d_pairs_tag_counts.begin(); i < d_pairs_newend.second; ++i) outfile << *i << "\n";
+        for(int i = 0; i < 7; ++i) outfile << d_pairs_tag_offset[i] << "\n";
+
+        outfile << "\nPAIRS_TAG\n";
+        // thrust::host_vector<uint8_t> h_pairs_tag = d_pairs_tag;
+        // for(int i = 0; i < h_pairs_tag.size(); ++i)
+        // {
+        //     outfile << static_cast<int>(h_pairs_tag[i]) << " ";
+        //     if((i+1) % 512 == 0) outfile << "\n";
+        // }
+
+        outfile.close();
+    });
+#endif
+
     rmm::device_vector<TileCSR_C_rev<ValueType>> Ctiles(_C_tileColIdx.size(), SPGEMM_STREAM_ALLOCATOR_TILECSRC_REV(STREAM_C));
     rmm::device_vector<int> _C_perTileNnz(_C_tileColIdx.size() + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
     
@@ -1721,7 +2145,7 @@ int main(int argc, char *argv[]) {
     thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_C), _C_perTileNnz.begin(), _C_perTileNnz.end(), _C_perTileNnz.begin());
 
     rmm::device_vector<ValueType> Ctiles_vals(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_VALUETYPE(STREAM_C));
-    rmm::device_vector<typename TileCSR_C_rev<ValueType>::IdxType> Ctiles_rowColIdx(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_UINT8(STREAM_C));
+    rmm::device_vector<uint8_t> Ctiles_rowColIdx(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_UINT8(STREAM_C));
 
     int numBlocksPerSm_Cs = 0;
     int numThreads_Cs = 128;
@@ -1763,37 +2187,133 @@ int main(int argc, char *argv[]) {
     });
 #endif  
 
-    auto arg1 = d_pairs.data().get();
-    auto arg2 = d_pairs.size();
-    auto arg3 =  Ctiles.data().get();
-    auto arg4 =  _C_perTileNnz.data().get();
-    auto arg5 = C_targetTile.data().get();
-    auto arg6 =  Atiles.data().get();
-    auto arg7 =  A_perTileNnz.data().get();
-    auto arg8 =  Btiles.data().get();
-    auto arg9 =  B_perTileNnz.data().get();
+    std::cout << "\nACCUMULATOR PHASE\n";
+    dim3 threads_mp {128};
+    for(int i = 0; i < 6; ++i)
+    {
+        if(d_pairs_tag_keys[i] == -1) break;
+        int d_pairs_size = d_pairs_tag_offset[i+1]-d_pairs_tag_offset[i];
+        std::cout << "Key: " << d_pairs_tag_keys[i] << " counts: " << d_pairs_size << "\n";
+        switch(d_pairs_tag_keys[i])
+        {
+            case 0:
+            {
+                dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
+                multiply_pairs_register_cache<<<blocks_mp, threads_mp, 0, STREAM_C>>>
+                (
+                    d_pairs.data().get() + d_pairs_tag_offset[i],
+                    d_pairs_size,
+                    Ctiles.data().get(),
+                    _C_perTileNnz.data().get(),
+                    C_targetTile.data().get(),
+                    Atiles.data().get(),
+                    A_perTileNnz.data().get(),
+                    Btiles.data().get(),
+                    B_perTileNnz.data().get()
+                );
+                std::cout << "Register cache accumulator launched\n";
+            }
+            break;
 
-    void *kernArgs[] = {
-        static_cast<void*>(&arg1),
-        static_cast<void*>(&arg2),
-        static_cast<void*>(&arg3),
-        static_cast<void*>(&arg4),
-        static_cast<void*>(&arg5),
-        static_cast<void*>(&arg6),
-        static_cast<void*>(&arg7),
-        static_cast<void*>(&arg8),
-        static_cast<void*>(&arg9),
-    };
+            case 1:
+            {
+                dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
+                multiply_pairs_default<ValueType, 32><<<blocks_mp, threads_mp, sizeof(ValueType) * 4 * 2 * 32 + 1, STREAM_C>>>
+                (
+                    d_pairs.data().get() + d_pairs_tag_offset[i],
+                    d_pairs_size,
+                    Ctiles.data().get(),
+                    _C_perTileNnz.data().get(),
+                    C_targetTile.data().get(),
+                    Atiles.data().get(),
+                    A_perTileNnz.data().get(),
+                    Btiles.data().get(),
+                    B_perTileNnz.data().get()
+                );
+                std::cout << "Default accumulator-32 launched\n";
+            }
+            break;
 
-    int numBlocksPerSm_mp = 0;
-    int numThreads_mp = 128;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm_mp, (void*)multiply_pairs<ValueType>, numThreads_mp, sizeof(TileCSR_rev<ValueType>) * 8);
-    std::cout << "multiply_pairs Max block count per SM with 128 threads: " << numBlocksPerSm_mp << "\n";
+            case 2:
+            {
+                dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
+                multiply_pairs_default<ValueType, 64><<<blocks_mp, threads_mp, sizeof(ValueType) * 4 * 2 * 64 + 1, STREAM_C>>>
+                (
+                    d_pairs.data().get() + d_pairs_tag_offset[i],
+                    d_pairs_size,
+                    Ctiles.data().get(),
+                    _C_perTileNnz.data().get(),
+                    C_targetTile.data().get(),
+                    Atiles.data().get(),
+                    A_perTileNnz.data().get(),
+                    Btiles.data().get(),
+                    B_perTileNnz.data().get()
+                );
+                std::cout << "Default accumulator-64 launched\n";
+            }
+            break;
 
-    dim3 threads_mp {numThreads_mp};
-    dim3 blocks_mp {numBlocksPerSm_mp * deviceProp.multiProcessorCount};
-    // revise later -- multi launch -- dynamic shmem depends on A and B's nnz, to maximize occupancy on each sparsity
-    CHECK_CUDA( cudaLaunchCooperativeKernel((void*)multiply_pairs<ValueType>, blocks_mp, threads_mp, kernArgs, sizeof(TileCSR_rev<ValueType>) * 8, STREAM_C) )
+            case 3:
+            {
+                dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
+                multiply_pairs_default<ValueType, 128><<<blocks_mp, threads_mp, sizeof(ValueType) * 4 * 2 * 128 + 1, STREAM_C>>>
+                (
+                    d_pairs.data().get() + d_pairs_tag_offset[i],
+                    d_pairs_size,
+                    Ctiles.data().get(),
+                    _C_perTileNnz.data().get(),
+                    C_targetTile.data().get(),
+                    Atiles.data().get(),
+                    A_perTileNnz.data().get(),
+                    Btiles.data().get(),
+                    B_perTileNnz.data().get()
+                );
+                std::cout << "Default accumulator-128 launched\n";
+            }
+            break;
+
+            case 4:
+            {
+                dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
+                multiply_pairs_default<ValueType, 192><<<blocks_mp, threads_mp, sizeof(ValueType) * 4 * 2 * 192 + 1, STREAM_C>>>
+                (
+                    d_pairs.data().get() + d_pairs_tag_offset[i],
+                    d_pairs_size,
+                    Ctiles.data().get(),
+                    _C_perTileNnz.data().get(),
+                    C_targetTile.data().get(),
+                    Atiles.data().get(),
+                    A_perTileNnz.data().get(),
+                    Btiles.data().get(),
+                    B_perTileNnz.data().get()
+                );
+                std::cout << "Default accumulator-192 launched\n";
+            }
+            break;
+
+            case 5:
+            {
+                dim3 blocks_mp {(d_pairs_size-1+threads_mp.x)/threads_mp.x};
+                multiply_pairs_tensor<<<blocks_mp, threads_mp, 0, STREAM_C>>>
+                (
+                    d_pairs.data().get() + d_pairs_tag_offset[i],
+                    d_pairs_size,
+                    Ctiles.data().get(),
+                    _C_perTileNnz.data().get(),
+                    C_targetTile.data().get(),
+                    Atiles.data().get(),
+                    A_perTileNnz.data().get(),
+                    Btiles.data().get(),
+                    B_perTileNnz.data().get()
+                );
+                std::cout << "Tensor Core accumulator launched\n";
+            }
+            break;
+
+            default:
+            continue;
+        }
+    }
 
 #ifdef DEBUG_11
     std::jthread DEBUG_11([&]{
