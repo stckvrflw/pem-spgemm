@@ -2476,7 +2476,7 @@ int main(int argc, char *argv[]) {
     rmm::device_vector<ValueType> Cvals(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_VALUETYPE(STREAM_C));
 
     dim3 threads_sC {tileSize * tileSize};
-    dim3 blocks_sC {Ctiles.size()/64};
+    dim3 blocks_sC {(Ctiles.size()+7)/8};
 
     sanitize_C<<<blocks_sC, threads_sC, 0, STREAM_C>>>
     (
