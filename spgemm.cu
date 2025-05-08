@@ -11,7 +11,6 @@ Author: Petrus E. Manurung
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/scan.h>
-#include <cooperative_groups/memcpy_async.h>
 #include <cooperative_groups/reduce.h>
 
 #include <thrust/sort.h>
@@ -21,6 +20,7 @@ Author: Petrus E. Manurung
 #include <thrust/unique.h>
 #include <thrust/partition.h>
 #include <thrust/iterator/transform_iterator.h>
+#include <thrust/scatter.h>
 
 #include <cub/block/block_scan.cuh>
 #include <cub/warp/warp_merge_sort.cuh>
@@ -79,24 +79,25 @@ decide_which_tile
     r_Ptr<long long> participating_tiles,
     cr_Ptr<int> d_I,
     cr_Ptr<int> d_J,
-    int tileRows,
     int nnz
 )
 {
     auto grid = cg::this_grid();
     auto my_tid = grid.thread_rank();
     // out of range check
-    if(grid.thread_rank() >= nnz) return;
-    int my_y = d_I[grid.thread_rank()];
-    int my_x = d_J[grid.thread_rank()];
-    int this_tile_y = my_y / tileSize;
-    int this_tile_x = my_x / tileSize;
+    if(my_tid >= nnz) return;
+    int my_y = d_I[my_tid];
+    int my_x = d_J[my_tid];
+    // int this_tile_y = my_y / tileSize;
+    // int this_tile_x = my_x / tileSize;
+    int this_tile_y = my_y >> 4;
+    int this_tile_x = my_x >> 4;
 
-    long long my_tile = (static_cast<long long>(this_tile_y) << 32) | this_tile_x;
-    // long long *my_participation = &participating_tiles[this_tile_y * tileRows + this_tile_x];
-    long long *my_participation = &participating_tiles[grid.thread_rank()];
-
-    *my_participation = my_tile;
+    // long long my_tile = (static_cast<long long>(this_tile_y) << 32) | this_tile_x;
+    long long my_tile = this_tile_y;
+    my_tile <<= 32;
+    my_tile |= this_tile_x;
+    participating_tiles[my_tid] = my_tile;
 }
 
 template<typename ValueType, int tileSize = 16>
@@ -143,15 +144,17 @@ generate_tiles_csr
         
         int my_row_group_rowPtr_offset = block_tile_offset_y + my_row_group.meta_group_rank();
         // if(my_row_group_rowPtr_offset >= d_rowPtr_size) return;
+        if(my_row_group_rowPtr_offset < d_rowPtr_size)
+        {
+            int my_row_group_rowPtr = d_rowPtr[my_row_group_rowPtr_offset];
+            int my_row_group_rowSize = d_rowPtr[my_row_group_rowPtr_offset + 1] - d_rowPtr[my_row_group_rowPtr_offset];
 
-        int my_row_group_rowPtr = d_rowPtr[my_row_group_rowPtr_offset];
-        int my_row_group_rowSize = d_rowPtr[my_row_group_rowPtr_offset + 1] - d_rowPtr[my_row_group_rowPtr_offset];
-
-        int thread_offset = binarySearch(&d_J[my_row_group_rowPtr], block_tile_offset_x + (int)my_row_group.thread_rank(), my_row_group_rowSize);
-        if(thread_offset != -1){
-            thread_offset += my_row_group_rowPtr;
-            thread_J = d_J[thread_offset];
-            thread_val = d_vals[thread_offset];
+            int thread_offset = binarySearch(&d_J[my_row_group_rowPtr], block_tile_offset_x + (int)my_row_group.thread_rank(), my_row_group_rowSize);
+            if(thread_offset != -1){
+                thread_offset += my_row_group_rowPtr;
+                thread_J = d_J[thread_offset];
+                thread_val = d_vals[thread_offset];
+            }
         }
         my_row_group.sync();
 
@@ -159,7 +162,7 @@ generate_tiles_csr
         unsigned my_row_nnz = __popc(my_row_group.ballot(thread_J != -1));
         MaskType my_row_mask = thread_J != -1 ? 1 : 0;
 
-        my_row_mask <<= (thread_J%tileSize); // maybe optimize later with cg::reduce?
+        my_row_mask <<= (thread_J%tileSize);
         // my_row_mask |=  my_row_group.shfl_down(my_row_mask, 8);
         // my_row_mask |=  my_row_group.shfl_down(my_row_mask, 4);
         // my_row_mask |=  my_row_group.shfl_down(my_row_mask, 2);
@@ -204,19 +207,20 @@ generate_tiles_csr
 __attribute__((optimize("O3")))
 int cusparse_highLevelMultiply
 (
-    cr_Ptr<int> dA_csrOffsets,
-    cr_Ptr<int> dA_columns,
-    cr_Ptr<float> dA_values,
-    unsigned A_num_rows,
-    unsigned A_num_cols,
-    unsigned A_nnz,
-    cr_Ptr<int> dB_csrOffsets,
-    cr_Ptr<int> dB_columns,
-    cr_Ptr<float> dB_values,
-    unsigned B_num_rows,
-    unsigned B_num_cols,
-    unsigned B_nnz,
+    r_Ptr<int> dA_csrOffsets,
+    r_Ptr<int> dA_columns,
+    r_Ptr<float> dA_values,
+    int A_num_rows,
+    int A_num_cols,
+    int A_nnz,
+    r_Ptr<int> dB_csrOffsets,
+    r_Ptr<int> dB_columns,
+    r_Ptr<float> dB_values,
+    int B_num_rows,
+    int B_num_cols,
+    int B_nnz,
     rmm::device_vector<int> *d_CtilePtr,
+    rmm::device_vector<int> *d_CtileRowIdx,
     rmm::device_vector<int> *d_CtileColIdx,
     cudaStream_t stream,
     rmm::exec_policy_nosync ASYNC_EXEC_POLICY
@@ -224,6 +228,7 @@ int cusparse_highLevelMultiply
 {
     int *dC_csrOffsets;
     int *dC_columns;
+    int *dC_rows;
     float *dC_values;
 
     cusparseHandle_t     handle = NULL;
@@ -241,11 +246,11 @@ int cusparse_highLevelMultiply
     CHECK_CUSPARSE( cusparseCreate(&handle) )
     CHECK_CUSPARSE( cusparseSetStream(handle, stream) )
     CHECK_CUSPARSE( cusparseCreateCsr(&matA, A_num_rows, A_num_cols, A_nnz,
-                                      const_cast<int*>(dA_csrOffsets), const_cast<int*>(dA_columns), const_cast<float*>(dA_values),
+                                      dA_csrOffsets, dA_columns, dA_values,
                                       CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
                                       CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F) )
     CHECK_CUSPARSE( cusparseCreateCsr(&matB, B_num_rows, B_num_cols, B_nnz,
-                                      const_cast<int*>(dB_csrOffsets), const_cast<int*>(dB_columns), const_cast<float*>(dB_values),
+                                      dB_csrOffsets, dB_columns, dB_values,
                                       CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
                                       CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F) )
     CHECK_CUSPARSE( cusparseCreateCsr(&matC, A_num_rows, B_num_cols, 0,
@@ -300,6 +305,7 @@ int cusparse_highLevelMultiply
     // allocate matrix C
     CHECK_CUDA( cudaMallocAsync((void**) &dC_columns, C_nnz1 * sizeof(int), stream)   )
     CHECK_CUDA( cudaMallocAsync((void**) &dC_values,  C_nnz1 * sizeof(float), stream) )
+    CHECK_CUDA( cudaMallocAsync((void**) &dC_rows, C_nnz1 * sizeof(int), stream) )
     // CHECK_CUDA( cudaMalloc((void**) &dC_columns, C_nnz1 * sizeof(int))   )
     // CHECK_CUDA( cudaMalloc((void**) &dC_values,  C_nnz1 * sizeof(float)) )
 
@@ -318,6 +324,8 @@ int cusparse_highLevelMultiply
                             &alpha, matA, matB, &beta, matC,
                             computeType, CUSPARSE_SPGEMM_DEFAULT, spgemmDesc) )
 
+    CHECK_CUSPARSE( cusparseXcsr2coo(handle, dC_csrOffsets, C_nnz1, C_num_rows1, dC_rows, CUSPARSE_INDEX_BASE_ZERO) )
+
     // destroy matrix/vector descriptors
     CHECK_CUSPARSE( cusparseSpGEMM_destroyDescr(spgemmDesc) )
     CHECK_CUSPARSE( cusparseDestroySpMat(matA) )
@@ -326,40 +334,30 @@ int cusparse_highLevelMultiply
     CHECK_CUSPARSE( cusparseDestroy(handle) )
 
     auto _dCtile = thrust::device_pointer_cast(dC_csrOffsets);
-    auto _dCcols = thrust::device_pointer_cast(dC_columns);
+    // auto _dCcols = thrust::device_pointer_cast(dC_columns);
+    // auto _dCrows = thrust::device_pointer_cast(dC_rows);
+    
+    // yep, this is not wrong.
+    // swapped because Xcsr2coo is confusing
+    auto _dCcols = thrust::device_pointer_cast(dC_rows);
+    auto _dCrows = thrust::device_pointer_cast(dC_columns);
 
     d_CtilePtr->resize(A_num_rows + 1);
+    d_CtileRowIdx->resize(C_nnz1);
     d_CtileColIdx->resize(C_nnz1);
     thrust::copy(ASYNC_EXEC_POLICY, _dCtile, _dCtile + A_num_rows + 1, d_CtilePtr->begin());
     thrust::copy(ASYNC_EXEC_POLICY, _dCcols, _dCcols + C_nnz1, d_CtileColIdx->begin());
-    // thrust::copy(_dCtile, _dCtile + A_num_rows + 1, d_CtilePtr->begin());
-    // thrust::copy(_dCcols, _dCcols + C_nnz1, d_CtileColIdx->begin());
+    thrust::copy(ASYNC_EXEC_POLICY, _dCrows, _dCrows + C_nnz1, d_CtileRowIdx->begin());
 
     cudaFreeAsync(dC_csrOffsets, stream);
     cudaFreeAsync(dC_columns, stream);
     cudaFreeAsync(dC_values, stream);
+    cudaFreeAsync(dC_rows, stream);
     // cudaFree(dC_csrOffsets);
     // cudaFree(dC_columns);
     // cudaFree(dC_values);
-    return 0;
-}
 
-template<int tileSize = 16>
-__global__ void __launch_bounds__(tileSize * tileSize)
-_tag_rows
-(
-    r_Ptr<int> rowIdx,
-    cr_Ptr<int> rowPtr,
-    int rowPtr_size
-)
-{
-    int global_tid = cg::this_grid().thread_rank();
-    if(global_tid >= rowPtr_size - 1 || global_tid == 0) return;
-
-    if(rowPtr[global_tid + 1] - rowPtr[global_tid] == 0) return;
-
-    int my_offset = rowPtr[global_tid];
-    rowIdx[my_offset] = 1;
+    return C_nnz1;
 }
 
 __device__ cuda::atomic<int, cuda::thread_scope_device> pairs_idx(0);
@@ -415,13 +413,15 @@ search_pairs
     cr_Ptr<int> A_colIdx,
     cr_Ptr<int> B_colPtr,
     cr_Ptr<int> B_rowIdx,
-    cr_Ptr<int> C_rowPtr_size,
-    cr_Ptr<int> C_colIdx_size,
+    // cr_Ptr<int> C_rowPtr_size,
+    // cr_Ptr<int> C_colIdx_size,
+    int C_rowPtr_size,
+    int C_colIdx_size,
     cr_Ptr<int> B_tileOffsets,
+    cr_Ptr<int> C_rowIdx,
     int *__restrict__ pairs_counter
 )
 {
-    namespace cg = cooperative_groups;
     auto grid = cg::this_grid();
     auto block = cg::this_thread_block();
     auto thread = cg::this_thread();
@@ -429,53 +429,59 @@ search_pairs
     int __first_pass_thread_counter = 0; // for pass = 0 only
 
     int t_start = grid.thread_rank();
-    int grid_num_threads = grid.num_threads();
-    while(t_start < *C_colIdx_size) {
-        int b_C_cols = C_colIdx[t_start];
+    while(t_start < C_colIdx_size) {
+        // int b_C_cols = C_colIdx[t_start];
 
-        int t_C_row = lowerBound(C_rowPtr, t_start, *C_rowPtr_size);
-        int t_C_col = b_C_cols;
+        // int t_C_row = lowerBound(C_rowPtr, t_start, *C_rowPtr_size);
+        // if(t_start < C_rowPtr[t_C_row]) --t_C_row;
+        int t_C_col = C_colIdx[t_start];
+        // int t_C_col = b_C_cols;
+        int t_C_row = C_rowIdx[t_start];
         decltype(A_colIdx) A_colIdx_segment = A_colIdx + A_rowPtr[t_C_row];
         decltype(B_rowIdx) B_rowIdx_segment = B_rowIdx + B_colPtr[t_C_col];
         int A_colIdx_segment_len = A_rowPtr[t_C_row + 1] - A_rowPtr[t_C_row];
         int B_rowIdx_segment_len = B_colPtr[t_C_col + 1] - B_colPtr[t_C_col];
         int AorB = A_colIdx_segment_len <= B_rowIdx_segment_len ? 1 : 0; // A = 1; B = 0;
 
-        if constexpr(pass == 0) {
+        if constexpr(pass == 0) 
+        {
         if(AorB)
         __first_pass_thread_counter += __find_pairs<0>(pairs, C_targetTile, t_start, A_colIdx_segment, A_colIdx_segment_len, B_rowIdx_segment, B_rowIdx_segment_len, A_rowPtr[t_C_row], B_colPtr[t_C_col], AorB, B_tileOffsets);
         else
         __first_pass_thread_counter += __find_pairs<0>(pairs, C_targetTile, t_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[t_C_col], A_rowPtr[t_C_row], AorB, B_tileOffsets);
         }
-        else {
+        else 
+        {
         if(AorB)
         __find_pairs<1>(pairs, C_targetTile, t_start, A_colIdx_segment, A_colIdx_segment_len, B_rowIdx_segment, B_rowIdx_segment_len, A_rowPtr[t_C_row], B_colPtr[t_C_col], AorB, B_tileOffsets);
         else
         __find_pairs<1>(pairs, C_targetTile, t_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[t_C_col], A_rowPtr[t_C_row], AorB, B_tileOffsets);
         }
-
+        
         t_start += grid.num_threads();
     }
 
-    if constexpr(pass == 0) {
-        block.sync();
-        __shared__ int total;
-        auto warp = cg::tiled_partition<32>(block);
-        if(block.thread_rank() == 0) total = 0;
-        int warp_total = cg::reduce(warp, __first_pass_thread_counter, cg::plus<int>());
-        if(warp.thread_rank() == 0) atomicAdd_block(&total, warp_total);
-        block.sync();
-        if(block.thread_rank() == 0) atomicAdd(pairs_counter, total);
-
-        return;
+    if constexpr(pass == 0) 
+    {
+    block.sync();
+    __shared__ int total;
+    auto warp = cg::tiled_partition<32>(block);
+    if(block.thread_rank() == 0) total = 0;
+    block.sync();
+    int warp_total = cg::reduce(warp, __first_pass_thread_counter, cg::plus<int>());
+    if(warp.thread_rank() == 0) atomicAdd_block(&total, warp_total);
+    block.sync();
+    if(block.thread_rank() == 0) atomicAdd(pairs_counter, total);
     }
-    grid.sync();
 
-    if constexpr(pass == 1)
-    if(grid.thread_rank() == 0) {
-        // *pairs_counter = pairs_idx.load(cuda::memory_order_relaxed);
-        *pairs_counter = pairs_idx.exchange(*pairs_counter, cuda::memory_order_relaxed);
-    }
+    // if constexpr(pass == 1)
+    // {
+    // grid.sync();
+    // if(grid.thread_rank() == 0) {
+    //     // *pairs_counter = pairs_idx.load(cuda::memory_order_relaxed);
+    //     *pairs_counter = pairs_idx.exchange(*pairs_counter, cuda::memory_order_relaxed);
+    // }
+    // }
 }
 
 __global__ void __launch_bounds__(128)
@@ -512,13 +518,6 @@ tag_pairs
         int curr_A_perTileNnz = A_perTileNnz[a+1] - A_perTileNnz[a];
         int curr_B_perTileNnz = B_perTileNnz[b+1] - B_perTileNnz[b];
 
-        // curr_d_pairs_tag.w = compare(curr_A_perTileNnz.w, curr_B_perTileNnz.w);
-        // curr_d_pairs_tag.x = compare(curr_A_perTileNnz.x, curr_B_perTileNnz.x);
-        // curr_d_pairs_tag.y = compare(curr_A_perTileNnz.y, curr_B_perTileNnz.y);
-        // curr_d_pairs_tag.z = compare(curr_A_perTileNnz.z, curr_B_perTileNnz.z);
-        
-        // *(reinterpret_cast<uchar4*>(&d_pairs_tag[thread_start])) = curr_d_pairs_tag;
-
         d_pairs_tag[thread_start] = compare(curr_A_perTileNnz, curr_B_perTileNnz);
         thread_start += cg::this_grid().num_threads();
     }
@@ -527,6 +526,16 @@ tag_pairs
 template<typename ValueType, int tileSize = 16>
 __global__ void __launch_bounds__(4 * 32) 
 allocate_C
+// (
+//     cr_Ptr<long long> d_pairs,
+//     int d_pairs_size,
+
+//     r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
+//     cr_Ptr<int> C_targetTiles,
+
+//     cr_Ptr<TileCSR_rev<ValueType,tileSize>> Atiles,
+//     cr_Ptr<TileCSR_rev<ValueType,tileSize>> Btiles
+// )
 (
     cr_Ptr<long long> d_pairs,
     int d_pairs_size,
@@ -612,6 +621,36 @@ allocate_C
         local_group_Ctiles_idx_start += grid.num_blocks() * block.num_threads() / local_group.size();
     }
 }
+
+// template<typename ValueType, int tileSize = 16>
+// __global__ void __launch_bounds__(4 * 32) 
+// allocate_C_setNnz
+// (
+//     r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
+//     int Ctiles_size,
+//     r_Ptr<int> _C_perTileNnz
+// )
+// {
+//     auto warp = cg::tiled_partition<32>(cg::this_thread_block());
+//     auto local_group = cg::tiled_partition<16>(warp);
+//     int lgtr = local_group.thread_rank();
+
+//     int local_group_Ctiles_idx_start = (blockIdx.x << 3) + ((threadIdx.x >> 5) << 1) + ((threadIdx.x%32)>>4);
+//     while(local_group_Ctiles_idx_start < Ctiles_size) 
+//     {
+//         unsigned my_Cmask = Ctiles[local_group_Ctiles_idx_start].mask[(lgtr>>1)];
+//         my_Cmask >>= (16 * ((lgtr % 2) ^ 0x1));
+//         my_Cmask &= 0xFFFF;
+//         int nnz = __popc(my_Cmask);
+//         int row_nnz = cg::exclusive_scan(local_group, nnz);
+//         Ctiles[local_group_Ctiles_idx_start].rowPtr[lgtr] = row_nnz;
+//         if(lgtr == 15) _C_perTileNnz[local_group_Ctiles_idx_start] = nnz + row_nnz;
+//         local_group.sync();
+
+//         // local_group_Ctiles_idx_start += grid.num_blocks() * block.num_threads() / local_group.size();
+//         local_group_Ctiles_idx_start += (gridDim.x << 3);
+//     }
+// }
 
 template<typename ValueType, int tileSize = 16>
 __global__ void __launch_bounds__(4 * 32) 
@@ -767,7 +806,7 @@ multiply_pairs_register_cache // lte 16
     }
 }
 
-template<typename ValueType, int S, int tileSize = 16>
+template<typename ValueType, int tileSize = 16>
 __global__ void 
 __launch_bounds__(tileSize * tileSize / 2)
 multiply_pairs_default // gt 16 lte 64 lte 96 lte 128 lte 192
@@ -790,7 +829,6 @@ multiply_pairs_default // gt 16 lte 64 lte 96 lte 128 lte 192
     using MaskType = uint16_t;
     using ValType = double;
 
-    // extern __shared__ ValType warp_tile_vals[];
     __shared__ MaskType warp_tile_mask      [4][2][16];
     __shared__ MaskType warp_elems_mask     [4][256];
     __shared__ IdxType warp_tileC_rowColIdx [4][256];
@@ -812,14 +850,6 @@ multiply_pairs_default // gt 16 lte 64 lte 96 lte 128 lte 192
         int halfwarp_tile_nnz = (halfwarp_mgr == 0) 
                             ? (_A_perTileNnz[halfwarp_tile_idx+1] - _A_perTileNnz[halfwarp_tile_idx]) 
                             : (_B_perTileNnz[halfwarp_tile_idx+1] - _B_perTileNnz[halfwarp_tile_idx]);
-
-        // for(int n = halfwarp.thread_rank(); n < halfwarp_tile_nnz; n+=halfwarp.num_threads())
-        // {
-        //     if constexpr(S == 32)   warp_tile_vals[(warp.meta_group_rank() << 6) + (halfwarp.meta_group_rank() << 5) + n] = halfwarp_tile[halfwarp_tile_idx].vals[n];
-        //     else if (S == 64)       warp_tile_vals[(warp.meta_group_rank() << 7) + (halfwarp.meta_group_rank() << 6) + n] = halfwarp_tile[halfwarp_tile_idx].vals[n];
-        //     else if (S == 128)      warp_tile_vals[(warp.meta_group_rank() << 8) + (halfwarp.meta_group_rank() << 7) + n] = halfwarp_tile[halfwarp_tile_idx].vals[n];
-        //     else /* S == 192 */     warp_tile_vals[(warp.meta_group_rank() * 384) + (halfwarp.meta_group_rank() * 192) + n] = halfwarp_tile[halfwarp_tile_idx].vals[n];
-        // }
 
         for(int i = warp_tr; i < tileC_nnz; i += 32)
         {
@@ -870,14 +900,6 @@ multiply_pairs_default // gt 16 lte 64 lte 96 lte 128 lte 192
             {
                 int A_offset = __popc( warp_tile_mask[warp_mgr][0][r] & (0xFFFFU >> (17-__ffs(my_mask))) );
                 int B_offset = __popc( warp_tile_mask[warp_mgr][1][__ffs(my_mask)-1] & (0xFFFFU >> (16-c)) );
-                // if constexpr(S == 32)
-                // sum += warp_tile_vals[(warp.meta_group_rank() << 6) + Atiles[A].rowPtr[r]+A_offset] * warp_tile_vals[(warp.meta_group_rank() << 6) + 32 + Btiles[B].rowPtr[__ffs(my_mask)-1]+B_offset];
-                // else if(S == 64)
-                // sum += warp_tile_vals[(warp.meta_group_rank() << 7) + Atiles[A].rowPtr[r]+A_offset] * warp_tile_vals[(warp.meta_group_rank() << 7) + 64 + Btiles[B].rowPtr[__ffs(my_mask)-1]+B_offset];
-                // else if(S == 128)
-                // sum += warp_tile_vals[(warp.meta_group_rank() << 8) + Atiles[A].rowPtr[r]+A_offset] * warp_tile_vals[(warp.meta_group_rank() << 8) + 128 + Btiles[B].rowPtr[__ffs(my_mask)-1]+B_offset];
-                // else
-                // sum += warp_tile_vals[(warp.meta_group_rank() * 384) + Atiles[A].rowPtr[r]+A_offset] * warp_tile_vals[(warp.meta_group_rank() * 384) + 192 + Btiles[B].rowPtr[__ffs(my_mask)-1]+B_offset];
                 sum += Atiles[A].vals[Atiles[A].rowPtr[r]+A_offset] * Btiles[B].vals[Btiles[B].rowPtr[__ffs(my_mask)-1]+B_offset];
 
                 my_mask &= (~(1 << (__ffs(my_mask)-1)));
@@ -1247,6 +1269,7 @@ sanitize_C
     int Ctiles_size,
     cr_Ptr<int> _C_rowPtr, 
     int _C_rowPtrSize,
+    cr_Ptr<int> _C_tileRowIdx,
     cr_Ptr<int> _C_tileColIdx, 
     cr_Ptr<int> _C_perTile_Nnz
 )
@@ -1257,7 +1280,7 @@ sanitize_C
     while(warp_Ctiles_id < Ctiles_size)
     {
         int warp_Ctile_x = _C_tileColIdx[warp_Ctiles_id];
-        int warp_Ctile_y = cg::invoke_one_broadcast(warp, lowerBound<int>, _C_rowPtr, warp_Ctiles_id, _C_rowPtrSize-1);
+        int warp_Ctile_y = _C_tileRowIdx[warp_Ctiles_id];
         int warp_Ctile_offset = _C_perTile_Nnz[warp_Ctiles_id];
         for(int n = warp.thread_rank(); n < _C_perTile_Nnz[warp_Ctiles_id+1]-_C_perTile_Nnz[warp_Ctiles_id]; n+=warp.num_threads())
         {
@@ -1289,6 +1312,7 @@ enum STREAMS {
 };
 
 // #define USE_COOPERATIVE_LAUNCH
+
 // #define DEBUG_1
 // #define DEBUG_2
 // #define DEBUG_3
@@ -1296,11 +1320,11 @@ enum STREAMS {
 // #define DEBUG_5
 // #define DEBUG_6
 // #define DEBUG_7
-// #define DEBUG_8
 // #define DEBUG_9
 // #define DEBUG_10
 // #define DEBUG_11
 // #define DEBUG_12
+
 
 int main(int argc, char *argv[]) {
     if(argc <= 1 || argc > 3) {
@@ -1345,32 +1369,6 @@ int main(int argc, char *argv[]) {
     << "Cols: " << B_cols << "\n"
     << "Nnz: " << B_nnz << "\n";
 
-    // {
-    //     char const *filename1 = "../src/DEBUG/READ_A.txt";
-    //     char const *filename2 = "../src/DEBUG/READ_B.txt";
-    //     std::ofstream outfile;
-
-    //     auto print = [&outfile] (auto v) { outfile << v << " "; };
-
-    //     outfile.open(filename1, std::ios::out);
-    //     outfile << "rows:\n";
-    //     std::for_each(A_I.begin(), A_I.end(), print);
-    //     outfile << "\n\ncols:\n";
-    //     std::for_each(A_J.begin(), A_J.end(), print);
-    //     outfile << "\n\nvals:\n";
-    //     std::for_each(A_val.begin(), A_val.end(), print);
-    //     outfile.close();
-
-    //     outfile.open(filename2, std::ios::out);
-    //     outfile << "rows:\n";
-    //     std::for_each(B_I.begin(), B_I.end(), print);
-    //     outfile << "\n\ncols:\n";
-    //     std::for_each(B_J.begin(), B_J.end(), print);
-    //     outfile << "\n\nvals:\n";
-    //     std::for_each(B_val.begin(), B_val.end(), print);
-    //     outfile.close();
-    // }
-
     int const OVERHEAD = (A_nnz + B_nnz) / 4;
     auto SPGEMM_MR = rmm::mr::cuda_async_memory_resource(sizeof(ValueType) * 2 * (A_nnz + B_nnz + OVERHEAD));
     auto SPGEMM_STREAM_ALLOCATOR_INT = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<int>(STREAM, SPGEMM_MR);};
@@ -1405,7 +1403,8 @@ int main(int argc, char *argv[]) {
     thrust::copy(ASYNC_EXEC_POLICY(STREAM_B), B_J.begin(), B_J.end(), B_d_J.begin());
     thrust::copy(ASYNC_EXEC_POLICY(STREAM_B), B_val.begin(), B_val.end(), B_d_val.begin());
 
-    // if(argv[2] == "TRANSPOSE"){
+    // if(argv[2] == "TRANSPOSE")
+    // {
     //     auto zit = thrust::make_zip_iterator(thrust::make_tuple(B_d_J.begin(), B_d_I.begin(), B_val.begin()));
     //     thrust::sort(ASYNC_EXEC_POLICY(STREAM_B), zit, zit + B_nnz);
     // }
@@ -1424,7 +1423,6 @@ int main(int argc, char *argv[]) {
         A_participating_tiles.data().get(), 
         A_d_I.data().get(), 
         A_d_J.data().get(), 
-        A_tileRows, 
         A_nnz
     );
     dim3 B_threads_dwc{tileSize * tileSize};
@@ -1434,16 +1432,16 @@ int main(int argc, char *argv[]) {
         B_participating_tiles.data().get(), 
         B_d_I.data().get(), 
         B_d_J.data().get(), 
-        B_tileCols, 
         B_nnz
     );
     
     rmm::device_vector<int> A_perTileNnz(SPGEMM_STREAM_ALLOCATOR_INT(STREAM_A));
+    int cntA = 0;
     {
     thrust::sort(ASYNC_EXEC_POLICY(STREAM_A), A_participating_tiles.begin(), A_participating_tiles.end(), thrust::less<long long>());
     
-    int cnt = thrust::unique_count(ASYNC_EXEC_POLICY(STREAM_A), A_participating_tiles.begin(), A_participating_tiles.end());
-    A_perTileNnz.resize(cnt + 1);
+    cntA = thrust::unique_count(ASYNC_EXEC_POLICY(STREAM_A), A_participating_tiles.begin(), A_participating_tiles.end());
+    A_perTileNnz.resize(cntA + 1);
     thrust::reduce_by_key(ASYNC_EXEC_POLICY(STREAM_A), A_participating_tiles.begin(), A_participating_tiles.end(), thrust::make_constant_iterator<int>(1), thrust::make_discard_iterator(), A_perTileNnz.begin());
     thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_A),A_perTileNnz.begin(), A_perTileNnz.end(), A_perTileNnz.begin());
 
@@ -1452,11 +1450,12 @@ int main(int argc, char *argv[]) {
     }
 
     rmm::device_vector<int> B_perTileNnz(SPGEMM_STREAM_ALLOCATOR_INT(STREAM_B));
+    int cntB = 0;
     {
     thrust::sort(ASYNC_EXEC_POLICY(STREAM_B), B_participating_tiles.begin(), B_participating_tiles.end(), thrust::less<long long>());
     
-    int cnt = thrust::unique_count(ASYNC_EXEC_POLICY(STREAM_B), B_participating_tiles.begin(), B_participating_tiles.end());
-    B_perTileNnz.resize(cnt + 1);
+    cntB = thrust::unique_count(ASYNC_EXEC_POLICY(STREAM_B), B_participating_tiles.begin(), B_participating_tiles.end());
+    B_perTileNnz.resize(cntB + 1);
     thrust::reduce_by_key(ASYNC_EXEC_POLICY(STREAM_B), B_participating_tiles.begin(), B_participating_tiles.end(), thrust::make_constant_iterator<int>(1), thrust::make_discard_iterator(), B_perTileNnz.begin());
     thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_B), B_perTileNnz.begin(), B_perTileNnz.end(), B_perTileNnz.begin());
 
@@ -1507,7 +1506,7 @@ int main(int argc, char *argv[]) {
             outfile << hB_perTileNnz[i] << " ";
             if((i+1)%64 == 0) outfile << "\n";
         }
-        thrust::copy(B_participating_tiles.begin(), B_participating_tiles.end(), B_participating_tiles.begin());
+        thrust::copy(B_participating_tiles.begin(), B_participating_tiles.end(), h_participating_tiles.begin());
         outfile << "size: " << h_participating_tiles.size() << "\n";
         outfile << "participating tiles: [";
         for(size_t i = 0; i < h_participating_tiles.size(); ++i) {
@@ -1526,7 +1525,17 @@ int main(int argc, char *argv[]) {
     {
     auto zit = thrust::make_zip_iterator(thrust::make_tuple(A_d_I.begin(), A_d_J.begin(), A_d_val.begin()));
     thrust::stable_sort(ASYNC_EXEC_POLICY(STREAM_A), zit, zit + A_nnz);
-    thrust::reduce_by_key(ASYNC_EXEC_POLICY(STREAM_A), A_d_I.begin(), A_d_I.end(), thrust::make_constant_iterator<int>(1), thrust::make_discard_iterator(), A_d_rowPtr.begin());
+
+    rmm::device_vector<int> A_d_rowPtr_tmp(A_rows, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_A));
+    rmm::device_vector<int> A_d_index(A_rows, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_A));
+    auto res = thrust::reduce_by_key(
+        ASYNC_EXEC_POLICY(STREAM_A), 
+        A_d_I.begin(), 
+        A_d_I.end(), 
+        thrust::make_constant_iterator<int>(1), 
+        A_d_index.begin(), 
+        A_d_rowPtr_tmp.begin());
+    thrust::scatter(ASYNC_EXEC_POLICY(STREAM_A), A_d_rowPtr_tmp.begin(), res.second, A_d_index.begin(), A_d_rowPtr.begin());
     thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_A), A_d_rowPtr.begin(), A_d_rowPtr.end(), A_d_rowPtr.begin());
     }
 
@@ -1534,7 +1543,17 @@ int main(int argc, char *argv[]) {
     {
     auto zit = thrust::make_zip_iterator(thrust::make_tuple(B_d_I.begin(), B_d_J.begin(), B_d_val.begin()));
     thrust::stable_sort(ASYNC_EXEC_POLICY(STREAM_B), zit, zit + B_nnz);
-    thrust::reduce_by_key(ASYNC_EXEC_POLICY(STREAM_B), B_d_I.begin(), B_d_I.end(), thrust::make_constant_iterator<int>(1), thrust::make_discard_iterator(), B_d_rowPtr.begin());
+
+    rmm::device_vector<int> B_d_rowPtr_tmp(B_rows, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_B));
+    rmm::device_vector<int> B_d_index(B_rows, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_B));
+    auto res = thrust::reduce_by_key(
+        ASYNC_EXEC_POLICY(STREAM_B), 
+        B_d_I.begin(), 
+        B_d_I.end(), 
+        thrust::make_constant_iterator<int>(1), 
+        B_d_index.begin(), 
+        B_d_rowPtr_tmp.begin());
+    thrust::scatter(ASYNC_EXEC_POLICY(STREAM_B), B_d_rowPtr_tmp.begin(), res.second, B_d_index.begin(), B_d_rowPtr.begin());
     thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_B), B_d_rowPtr.begin(), B_d_rowPtr.end(), B_d_rowPtr.begin());
     }
 
@@ -1580,14 +1599,14 @@ int main(int argc, char *argv[]) {
 #endif
 
     dim3 A_threads_gtc {tileSize * tileSize};
-    dim3 A_blocks_gtc {A_participating_tiles.size()};
+    dim3 A_blocks_gtc {cntA};
 
-    rmm::device_vector<TileCSR_rev<ValueType>> Atiles(A_participating_tiles.size(), SPGEMM_STREAM_ALLOCATOR_TILECSR_REV(STREAM_A));
+    rmm::device_vector<TileCSR_rev<ValueType>> Atiles(cntA, SPGEMM_STREAM_ALLOCATOR_TILECSR_REV(STREAM_A));
     rmm::device_vector<ValueType> Atiles_vals(A_nnz, SPGEMM_STREAM_ALLOCATOR_VALUETYPE(STREAM_A));
     rmm::device_vector<uint8_t> Atiles_rowColIdx(A_nnz, SPGEMM_STREAM_ALLOCATOR_UINT8(STREAM_A));
     rmm::device_vector<int> 
     A_d_cols(1, A_cols, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_A)), 
-    A_participating_tiles_size(1, A_participating_tiles.size(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_A));
+    A_participating_tiles_size(1, cntA, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_A));
 
     generate_tiles_csr<ValueType><<<A_blocks_gtc, A_threads_gtc,0, STREAM_A>>>
     (
@@ -1604,14 +1623,14 @@ int main(int argc, char *argv[]) {
     );
 
     dim3 B_threads_gtc {tileSize * tileSize};
-    dim3 B_blocks_gtc {B_participating_tiles.size()};
+    dim3 B_blocks_gtc {cntB};
 
-    rmm::device_vector<TileCSR_rev<ValueType>> Btiles(B_participating_tiles.size(), SPGEMM_STREAM_ALLOCATOR_TILECSR_REV(STREAM_B));
+    rmm::device_vector<TileCSR_rev<ValueType>> Btiles(cntB, SPGEMM_STREAM_ALLOCATOR_TILECSR_REV(STREAM_B));
     rmm::device_vector<ValueType> Btiles_vals(B_nnz, SPGEMM_STREAM_ALLOCATOR_VALUETYPE(STREAM_B));
     rmm::device_vector<uint8_t> Btiles_rowColIdx(B_nnz, SPGEMM_STREAM_ALLOCATOR_UINT8(STREAM_B));
     rmm::device_vector<int> 
     B_d_cols(1, B_cols, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_B)), 
-    B_participating_tiles_size(1, B_participating_tiles.size(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_B));
+    B_participating_tiles_size(1, cntB, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_B));
 
     generate_tiles_csr<ValueType><<<B_blocks_gtc, B_threads_gtc,0, STREAM_B>>>
     (
@@ -1752,20 +1771,21 @@ int main(int argc, char *argv[]) {
 #endif
 
     // create High level Representation of A -> A_
+    rmm::device_vector<int> _A_tileRowPtr_tmp(A_tileRows, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_D));
     rmm::device_vector<int> _A_tileRowPtr(A_tileRows + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_D));
-    rmm::device_vector<int> _A_tileColIdx(A_participating_tiles.size(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_D));
-    rmm::device_vector<float> _A_tileVals(A_participating_tiles.size(), SPGEMM_STREAM_ALLOCATOR_FLOAT(STREAM_D));
+    rmm::device_vector<int> _A_tileColIdx(cntA, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_D));
+    rmm::device_vector<float> _A_tileVals(cntA, 1.0f, SPGEMM_STREAM_ALLOCATOR_FLOAT(STREAM_D));
     
-    thrust::reduce_by_key(
+    auto newendA = thrust::reduce_by_key(
         ASYNC_EXEC_POLICY(STREAM_D),
         thrust::make_transform_iterator(A_participating_tiles.begin(), getHigh32()),
         thrust::make_transform_iterator(A_participating_tiles.end(), getHigh32()),
         thrust::make_constant_iterator<int>(1),
-        thrust::make_discard_iterator(),
-        _A_tileRowPtr.begin()
+        _A_tileColIdx.begin(), // borrow _A_tileColIdx as temporary index buffer
+        _A_tileRowPtr_tmp.begin()
     );
-    thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_D), 
-    _A_tileRowPtr.begin(), _A_tileRowPtr.end(), _A_tileRowPtr.begin());
+    thrust::scatter(ASYNC_EXEC_POLICY(STREAM_D), _A_tileRowPtr_tmp.begin(), newendA.second, _A_tileColIdx.begin(), _A_tileRowPtr.begin());
+    thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_D), _A_tileRowPtr.begin(), _A_tileRowPtr.end(), _A_tileRowPtr.begin());
 
     thrust::copy(
         ASYNC_EXEC_POLICY(STREAM_D),
@@ -1775,20 +1795,21 @@ int main(int argc, char *argv[]) {
     );
 
     // create High level Representation of B -> B_
+    rmm::device_vector<int> _B_tileRowPtr_tmp(B_tileRows, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
     rmm::device_vector<int> _B_tileRowPtr(B_tileRows + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
-    rmm::device_vector<int> _B_tileColIdx(B_participating_tiles.size(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
-    rmm::device_vector<float> _B_tileVals(B_participating_tiles.size(), SPGEMM_STREAM_ALLOCATOR_FLOAT(STREAM_E));
+    rmm::device_vector<int> _B_tileColIdx(cntB, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
+    rmm::device_vector<float> _B_tileVals(cntB, 1.0f, SPGEMM_STREAM_ALLOCATOR_FLOAT(STREAM_E));
     
-    thrust::reduce_by_key(
+    auto newendB = thrust::reduce_by_key(
         ASYNC_EXEC_POLICY(STREAM_E),
         thrust::make_transform_iterator(B_participating_tiles.begin(), getHigh32()),
         thrust::make_transform_iterator(B_participating_tiles.end(), getHigh32()),
         thrust::make_constant_iterator<int>(1),
-        thrust::make_discard_iterator(),
-        _B_tileRowPtr.begin()
+        _B_tileColIdx.begin(), // borrow _B_tileColIdx as temporary index buffer
+        _B_tileRowPtr_tmp.begin()
     );
-    thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_E), 
-    _B_tileRowPtr.begin(), _B_tileRowPtr.end(), _B_tileRowPtr.begin());
+    thrust::scatter(ASYNC_EXEC_POLICY(STREAM_E), _B_tileRowPtr_tmp.begin(), newendB.second, _B_tileColIdx.begin(), _B_tileRowPtr.begin());
+    thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_E), _B_tileRowPtr.begin(), _B_tileRowPtr.end(), _B_tileRowPtr.begin());
 
     thrust::copy(
         ASYNC_EXEC_POLICY(STREAM_E),
@@ -1797,12 +1818,14 @@ int main(int argc, char *argv[]) {
         _B_tileColIdx.begin()
     );
 
-    std::jthread destroy_participating_tiles([&A_participating_tiles, &B_participating_tiles, &streams](){
-        cudaStreamSynchronize(STREAM_D);
-        rmm::device_vector<long long>().swap(A_participating_tiles);
-        cudaStreamSynchronize(STREAM_E);
-        rmm::device_vector<long long>().swap(B_participating_tiles);
-    });
+    // std::jthread destroy_participating_tiles([&](){
+    //     cudaStreamSynchronize(STREAM_D);
+    //     rmm::device_vector<long long>().swap(A_participating_tiles);
+    //     rmm::device_vector<int>().swap(_A_tileRowPtr_tmp);
+    //     cudaStreamSynchronize(STREAM_E);
+    //     rmm::device_vector<long long>().swap(B_participating_tiles);
+    //     rmm::device_vector<int>().swap(_B_tileRowPtr_tmp);
+    // });
 
 #ifdef DEBUG_4
     std::jthread DEBUG_4([&](){
@@ -1811,15 +1834,19 @@ int main(int argc, char *argv[]) {
         std::ofstream outfile;
         outfile.open(filename, std::ios::out);
 
+        cudaStreamSynchronize(STREAM_D);
         thrustHvec<int> hAtilePtr = _A_tileRowPtr;
         thrustHvec<int> hAtileColIdx = _A_tileColIdx;
         thrustHvec<float> hAtileVal = _A_tileVals;
 
-        cudaStreamSynchronize(STREAM_A);
+        // cudaStreamSynchronize(STREAM_A);
+        outfile << "tilePtrSize " << hAtilePtr.size()
+        << "\ntileColIdxSize " << hAtileColIdx.size()
+        << "\ntileValSize " << hAtileVal.size() << "\n";
 
         outfile << "AtileRowPtr: [\n";
         for(int i = 0; i < hAtilePtr.size(); ++i) {
-            outfile << hAtilePtr.data()[i] << " ";
+            outfile << hAtilePtr.data()[i] << "\n";
         }
         outfile << "\n]" << std::endl;
         outfile << "\nAtileColIdx: [\n";
@@ -1839,16 +1866,19 @@ int main(int argc, char *argv[]) {
         char const *filename = "../src/DEBUG/DEBUG_B_4";
         std::ofstream outfile;
         outfile.open(filename, std::ios::out);
-
+        cudaStreamSynchronize(STREAM_E);
         thrustHvec<int> hBtilePtr = _B_tileRowPtr;
         thrustHvec<int> hBtileColIdx = _B_tileColIdx;
         thrustHvec<float> hBtileVal = _B_tileVals;
 
-        cudaStreamSynchronize(STREAM_B);
+        // cudaStreamSynchronize(STREAM_B);
+        outfile << "tilePtrSize " << hBtilePtr.size()
+        << "\ntileColIdxSize " << hBtileColIdx.size()
+        << "\ntileValSize " << hBtileVal.size() << "\n";
 
-        outfile << "BtileRowPtr: [";
+        outfile << "BtileRowPtr: [\n";
         for(int i = 0; i < hBtilePtr.size(); ++i) {
-            outfile << hBtilePtr.data()[i] << " ";
+            outfile << hBtilePtr.data()[i] << "\n";
         }
         outfile << "]" << std::endl;
         outfile << "BtileColIdx: [";
@@ -1867,9 +1897,18 @@ int main(int argc, char *argv[]) {
     });
 #endif
     
-    rmm::device_vector<int> _C_tilePtr(SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C)), _C_tileColIdx(SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
     cudaStreamSynchronize(STREAM_D);
+    rmm::device_vector<long long>().swap(A_participating_tiles);
+    rmm::device_vector<int>().swap(_A_tileRowPtr_tmp);
     cudaStreamSynchronize(STREAM_E);
+    // rmm::device_vector<long long>().swap(B_participating_tiles);
+    // rmm::device_vector<int>().swap(_B_tileRowPtr_tmp);
+
+    rmm::device_vector<int> 
+    _C_tilePtr(SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C)), 
+    _C_tileColIdx(SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C)),
+    _C_tileRowIdx(SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
+
     cusparse_highLevelMultiply
     (
         _A_tileRowPtr.data().get(),
@@ -1884,10 +1923,15 @@ int main(int argc, char *argv[]) {
         B_tileRows,
         B_tileCols,
         _B_tileVals.size(),
-        &_C_tilePtr, &_C_tileColIdx,
+        &_C_tilePtr, &_C_tileColIdx, &_C_tileRowIdx,
         STREAM_C,
         ASYNC_EXEC_POLICY(STREAM_C)
     );
+
+    // {
+    // auto zit = thrust::make_zip_iterator(thrust::make_tuple(_C_tileRowIdx.begin(), _C_tileColIdx.begin()));
+    // thrust::stable_sort(ASYNC_EXEC_POLICY(STREAM_C), zit, zit+_C_tileRowIdx.size());
+    // }
 
 #ifdef DEBUG_5
     std::jthread DEBUG_5([&](){
@@ -1896,8 +1940,9 @@ int main(int argc, char *argv[]) {
         outfile.open(filename, std::ios::out);
 
         cudaStreamSynchronize(STREAM_C);
-        thrustHvec<int> hCtilePtr = _C_tilePtr;
-        thrustHvec<int> hCtileColIdx = _C_tileColIdx;
+        thrustHvecPin<int> hCtilePtr = _C_tilePtr;
+        thrustHvecPin<int> hCtileColIdx = _C_tileColIdx;
+        thrustHvecPin<int> hCtileRowIdx = _C_tileRowIdx;
         outfile << "hCtilePtr nums: " << hCtilePtr.size() << "\n";
         outfile << "hCtileColIdx nums: " << hCtileColIdx.size() << "\n";
         outfile << "_C_tilePtr: [\n";
@@ -1910,127 +1955,154 @@ int main(int argc, char *argv[]) {
             outfile << hCtileColIdx.data()[i] << " ";
         }
         outfile << "\n]" << std::endl;
+        outfile << "\n_C_tileRowIdx: [\n";
+        for(int i = 0; i < hCtileRowIdx.size(); ++i) {
+            outfile << hCtileRowIdx.data()[i] << " ";
+        }
+        outfile << "\n]" << std::endl;
 
         outfile.close();
     });
 #endif
 
+    cudaStreamSynchronize(STREAM_C);
+    std::cout << "\nCtiles: " <<  _C_tilePtr.back() << "\n";
+
     // transpose _B
-    dim3 threads_tr {tileSize * tileSize};
-    dim3 blocks_tr {(_B_tileRowPtr.size()-1 - 1 + threads_tr.x)/threads_tr.x};
-    rmm::device_vector<int> _B_tileRowIdx(_B_tileColIdx.size(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_B));
-    _tag_rows<<<blocks_tr, threads_tr, 0, STREAM_B>>>(_B_tileRowIdx.data().get(), _B_tileRowPtr.data().get(), _B_tileRowPtr.size());
-    thrust::inclusive_scan(ASYNC_EXEC_POLICY(STREAM_B), _B_tileRowIdx.begin(), _B_tileRowIdx.end(), _B_tileRowIdx.begin());
-    rmm::device_vector<int> _B_tileColPtr(B_tileCols + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_B));
-    rmm::device_vector<int> _B_tileOffsets(_B_tileColIdx.size(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_B));
+    rmm::device_vector<int> _B_tileOffsets(cntB, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
+    thrust::sequence(ASYNC_EXEC_POLICY(STREAM_E), _B_tileOffsets.begin(), _B_tileOffsets.end());
+    thrust::transform(ASYNC_EXEC_POLICY(STREAM_E), B_participating_tiles.begin(), B_participating_tiles.end(), B_participating_tiles.begin(), swap32());
     {
-        thrust::sequence(ASYNC_EXEC_POLICY(STREAM_B), _B_tileOffsets.begin(), _B_tileOffsets.end());
-
-        auto zit = thrust::make_zip_iterator(thrust::make_tuple(_B_tileColIdx.begin(), _B_tileRowIdx.begin(), _B_tileOffsets.begin()));
-        thrust::stable_sort(ASYNC_EXEC_POLICY(STREAM_B), zit, zit + _B_tileColIdx.size());
-        thrust::reduce_by_key(ASYNC_EXEC_POLICY(STREAM_B), _B_tileColIdx.begin(), _B_tileColIdx.end(), thrust::make_constant_iterator<int>(1), thrust::make_discard_iterator(), _B_tileColPtr.begin());
-        thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_B), _B_tileColPtr.begin(), _B_tileColPtr.end(), _B_tileColPtr.begin());
-
-        _B_tileRowPtr.clear();
-        rmm::device_vector<int>().swap(_B_tileRowPtr);
+    auto zit = thrust::make_zip_iterator(thrust::make_tuple(B_participating_tiles.begin(), _B_tileOffsets.begin()));
+    thrust::sort(ASYNC_EXEC_POLICY(STREAM_E), zit, zit+B_participating_tiles.size());
     }
+
+    rmm::device_vector<int> _B_tileColPtr_tmp(B_tileCols, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
+    rmm::device_vector<int> _B_tileColPtr(B_tileCols + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
+    rmm::device_vector<int> _B_tileRowIdx(cntB, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
+    auto newendBB = thrust::reduce_by_key(
+        ASYNC_EXEC_POLICY(STREAM_E),
+        thrust::make_transform_iterator(B_participating_tiles.begin(), getHigh32()),
+        thrust::make_transform_iterator(B_participating_tiles.end(), getHigh32()),
+        thrust::make_constant_iterator<int>(1),
+        _B_tileRowIdx.begin(), // borrow _B_tileRowIdx as temporary index buffer
+        _B_tileColPtr_tmp.begin()
+    );
+    thrust::scatter(ASYNC_EXEC_POLICY(STREAM_E), _B_tileColPtr_tmp.begin(), newendBB.second, _B_tileRowIdx.begin(), _B_tileColPtr.begin());
+    thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_E), _B_tileColPtr.begin(), _B_tileColPtr.end(), _B_tileColPtr.begin());
+    thrust::copy(
+        ASYNC_EXEC_POLICY(STREAM_E),
+        thrust::make_transform_iterator(B_participating_tiles.begin(), getLow32()),
+        thrust::make_transform_iterator(B_participating_tiles.end(), getLow32()),
+        _B_tileRowIdx.begin()
+    );
+
+    cudaStreamSynchronize(STREAM_E);
+    rmm::device_vector<long long>().swap(B_participating_tiles);
+    rmm::device_vector<int>().swap(_B_tileRowPtr_tmp);
+    cudaDeviceSynchronize();
 
 #ifdef DEBUG_6
     std::jthread DEBUG_6([&](){
+        {
         char const *filename = "../src/DEBUG/DEBUG_B_6";
         std::ofstream outfile;
         outfile.open(filename, std::ios::out);
 
-        cudaStreamSynchronize(STREAM_B);
-        outfile << "_B_tileColPtr: [\n";
+        cudaStreamSynchronize(STREAM_E);
+        outfile << "_B_tileColPtr size " << _B_tileColPtr.size() << "\n";
+        outfile << "_B_tileColPtr: \n[\n";
         for(int i = 0; i < _B_tileColPtr.size(); ++i) {
             outfile << _B_tileColPtr.data()[i] << " ";
         }
-        outfile << "\n]" << std::endl;
-        outfile << "\n_B_tileRowIdx: [\n";
+        outfile << "\n]\n";
+        outfile << "_B_tileRowIdx size " << _B_tileRowIdx.size() << "\n";
+        outfile << "\n_B_tileRowIdx: \n[\n";
         for(int i = 0; i < _B_tileRowIdx.size(); ++i) {
             outfile << _B_tileRowIdx.data()[i] << " ";
         }
         outfile << "\n]" << std::endl;
 
         outfile.close();
+        }
+        {
+        char const *filename = "../src/DEBUG/DEBUG_B_6_2";
+        std::ofstream outfile;
+        outfile.open(filename, std::ios::out);
+
+        cudaStreamSynchronize(STREAM_E);
+        outfile << "B_tileOffsets\n\n";
+        thrust::host_vector<int> B_tileOffsets = _B_tileOffsets;
+        for(int i = 0; i < B_tileOffsets.size(); ++i) outfile << i << " ";
+        outfile << "\n";
+        for(auto i: B_tileOffsets) outfile << i << " ";
+
+        outfile.close();
+        }
     });
 #endif
-
+    
     std::cout << "\nCOUNTING PAIRS\n";
 
-    int numBlocksPerSm_sp = 0;
-    int numThreads_sp = 256;
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, 0);
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm_sp, search_pairs<0>, numThreads_sp, 0);
-    std::cout << "search_pairs<0> Max block count per SM with 256 threads: " << numBlocksPerSm_sp << "\n";
 
-    dim3 threads_sp {numThreads_sp};
-    dim3 blocks_sp {numBlocksPerSm_sp * deviceProp.multiProcessorCount};
+    dim3 threads_sp{256};
+    dim3 blocks_sp{(_C_tilePtr.back()-1+threads_sp.x)/threads_sp.x};
 
-    int *_C_tilePtr_size, *_C_tileColIdx_size;
-    int CtilePtrSize = _C_tilePtr.size();
-    int CtileColIdxSize = _C_tileColIdx.size();
-    cudaMallocAsync(&_C_tilePtr_size, sizeof(int), STREAM_C);
-    cudaMallocAsync(&_C_tileColIdx_size, sizeof(int), STREAM_C);
-    cudaMemcpyAsync(_C_tilePtr_size, &CtilePtrSize, sizeof(int), cudaMemcpyHostToDevice, STREAM_C);
-    cudaMemcpyAsync(_C_tileColIdx_size, &CtileColIdxSize, sizeof(int), cudaMemcpyHostToDevice, STREAM_C);
-
-    int *pairs_count;
-    cudaMallocManaged(&pairs_count, sizeof(int));
-    cudaMemsetAsync(pairs_count, 0, sizeof(int), STREAM_C);
-
-    // auto ptr1 = d_pairs.data().get();
-    long long *ptr1 = nullptr;
-    int *ptr2 = nullptr;
-    auto ptr3 = _C_tilePtr.data().get();
-    auto ptr4 = _C_tileColIdx.data().get();
-    auto ptr5 = _A_tileRowPtr.data().get();
-    auto ptr6 = _A_tileColIdx.data().get();
-    auto ptr7 = _B_tileColPtr.data().get();
-    auto ptr8 = _B_tileRowIdx.data().get();
-    auto ptr9 = _C_tilePtr_size;
-    auto ptr10 = _C_tileColIdx_size;
-    auto ptr11 = _B_tileOffsets.data().get();
-
-    void *kern_args[] = {
-        static_cast<void*>(&ptr1),
-        static_cast<void*>(&ptr2),
-        static_cast<void*>(&ptr3),
-        static_cast<void*>(&ptr4),
-        static_cast<void*>(&ptr5),
-        static_cast<void*>(&ptr6),
-        static_cast<void*>(&ptr7),
-        static_cast<void*>(&ptr8),
-        static_cast<void*>(&ptr9),
-        static_cast<void*>(&ptr10),
-        static_cast<void*>(&ptr11),
-        static_cast<void*>(&pairs_count)
-    };
-
-    cudaStreamSynchronize(STREAM_B); // _B_tileOffsets comes from STREAM_B
-    // first pass
-    CHECK_CUDA( cudaLaunchCooperativeKernel((void*)search_pairs<0>, blocks_sp, threads_sp, kern_args, 0, STREAM_C) )
+    // std::cout <<"\nSEARCH PAIRS DEBUGGING\n";
+    // printf("_C_tileColIdx size: %d\n_A_tileColIdx size: %d\n_B_tileRowIdx size: %d\n_C_tileRowIdx size: %d\n",
+    // _C_tileColIdx.size(), _A_tileColIdx.size(), _B_tileRowIdx.size(), _C_tileRowIdx.size());
+    // std::cout << "_B_tileColPtr.back() " << _B_tileColPtr.back() << "\n";
+    
+    int *d_pairs_count, *h_pairs_count;
+    cudaMallocAsync(&d_pairs_count, sizeof(int), STREAM_C);
+    h_pairs_count = new int;
+    cudaStreamSynchronize(STREAM_E);
+    search_pairs<0><<<blocks_sp, threads_sp, 0, STREAM_C>>>
+    (
+        nullptr,
+        nullptr,
+        _C_tilePtr.data().get(),
+        _C_tileColIdx.data().get(),
+        _A_tileRowPtr.data().get(),
+        _A_tileColIdx.data().get(),
+        _B_tileColPtr.data().get(),
+        _B_tileRowIdx.data().get(),
+        _C_tilePtr.size()-1,
+        _C_tileColIdx.size(),
+        _B_tileOffsets.data().get(),
+        _C_tileRowIdx.data().get(),
+        d_pairs_count
+    );
+    cudaMemcpyAsync(h_pairs_count, d_pairs_count, sizeof(int), cudaMemcpyDeviceToHost, STREAM_C);
     cudaStreamSynchronize(STREAM_C);
-    rmm::device_vector<long long> d_pairs(*pairs_count, SPGEMM_STREAM_ALLOCATOR_LONGLONG(STREAM_C));
-    rmm::device_vector<int> C_targetTile(*pairs_count, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
-    rmm::device_vector<uint8_t> d_pairs_tag(*pairs_count, SPGEMM_STREAM_ALLOCATOR_UINT8(STREAM_C));
-    std::cout << "FIRST PASS pairs count: " << *pairs_count << "\n";
-    // second pass
-    ptr1 = d_pairs.data().get();
-    ptr2 = C_targetTile.data().get();
-    kern_args[0] = static_cast<void*>(&ptr1);
-    kern_args[1] = static_cast<void*>(&ptr2);
-    cudaMemsetAsync(pairs_count, 0, sizeof(int), STREAM_C);
-    // blocks_sp.x = 7; // DELETE LATER
-    CHECK_CUDA( cudaLaunchCooperativeKernel((void*)search_pairs<1>, blocks_sp, threads_sp, kern_args, 0, STREAM_C) )
+    std::cout << "Pairs count: " << *h_pairs_count << "\n";
+
+    rmm::device_vector<long long> d_pairs(*h_pairs_count);
+    rmm::device_vector<int> C_targetTile(*h_pairs_count);
+    search_pairs<1><<<blocks_sp, threads_sp, 0, STREAM_C>>>
+    (
+        d_pairs.data().get(),
+        C_targetTile.data().get(),
+        _C_tilePtr.data().get(),
+        _C_tileColIdx.data().get(),
+        _A_tileRowPtr.data().get(),
+        _A_tileColIdx.data().get(),
+        _B_tileColPtr.data().get(),
+        _B_tileRowIdx.data().get(),
+        _C_tilePtr.size()-1,
+        _C_tileColIdx.size(),
+        _B_tileOffsets.data().get(),
+        _C_tileRowIdx.data().get(),
+        d_pairs_count
+    );
 
 #ifdef DEBUG_9
     std::jthread debug_intersection([&]()
     {
         cudaStreamSynchronize(STREAM_C);
-        std::cout << "SECOND PASS pairs count: " << *pairs_count << "\n";
+        std::cout << "SECOND PASS pairs count: " << *h_pairs_count << "\n";
         thrustDvec<long long> h_pairs = d_pairs;
         thrust::sort(h_pairs.begin(), h_pairs.end(), thrust::less<long long>());
         thrust::sort(d_pairs.begin(), d_pairs.end(), thrust::less<long long>());
@@ -2074,29 +2146,30 @@ int main(int argc, char *argv[]) {
         }
     });
 #endif
-
+    
+    // rmm::device_vector<uint8_t> d_pairs_tag(*h_pairs_count, SPGEMM_STREAM_ALLOCATOR_UINT8(STREAM_C));
     // tag pairs, 0 -> register cache, 1 -> < 192, usual, 2 -> > 192, dense, use tensor cores
-    dim3 threads_tp {128};
-    dim3 blocks_tp {(d_pairs_tag.size()-1+threads_tp.x)/threads_tp.x};
-    tag_pairs<<<blocks_tp, threads_tp, 0, STREAM_C>>>
-    (
-        d_pairs_tag.data().get(), 
-        d_pairs_tag.size(), 
-        d_pairs.data().get(), 
-        A_perTileNnz.data().get(), 
-        B_perTileNnz.data().get()
-    );
+    // dim3 threads_tp {128};
+    // dim3 blocks_tp {(d_pairs_tag.size()-1+threads_tp.x)/threads_tp.x};
+    // tag_pairs<<<blocks_tp, threads_tp, 0, STREAM_C>>>
+    // (
+    //     d_pairs_tag.data().get(), 
+    //     d_pairs_tag.size(), 
+    //     d_pairs.data().get(), 
+    //     A_perTileNnz.data().get(), 
+    //     B_perTileNnz.data().get()
+    // );
 
-    rmm::device_vector<int> d_pairs_tag_keys(6, -1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
-    rmm::device_vector<int> d_pairs_tag_offset(7, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
-    {
-        auto zit = thrust::make_zip_iterator(thrust::make_tuple(d_pairs.begin(), C_targetTile.begin()));
-        thrust::sort_by_key(ASYNC_EXEC_POLICY(STREAM_C), d_pairs_tag.begin(), d_pairs_tag.end(), zit);
-        // auto zit = thrust::make_zip_iterator(thrust::make_tuple(d_pairs_tag.begin(), d_pairs.begin(), C_targetTile.begin()));
-        // thrust::stable_sort(ASYNC_EXEC_POLICY(STREAM_C), zit, zit + d_pairs_tag.size());
-        thrust::reduce_by_key(ASYNC_EXEC_POLICY(STREAM_C), d_pairs_tag.begin(), d_pairs_tag.end(), thrust::make_constant_iterator<int>(1), d_pairs_tag_keys.begin(), d_pairs_tag_offset.begin());
-        thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_C), d_pairs_tag_offset.begin(), d_pairs_tag_offset.end(), d_pairs_tag_offset.begin());
-    }
+    // rmm::device_vector<int> d_pairs_tag_keys(6, -1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
+    // rmm::device_vector<int> d_pairs_tag_offset(7, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
+    // {
+    //     auto zit = thrust::make_zip_iterator(thrust::make_tuple(d_pairs.begin(), C_targetTile.begin()));
+    //     thrust::sort_by_key(ASYNC_EXEC_POLICY(STREAM_C), d_pairs_tag.begin(), d_pairs_tag.end(), zit);
+    //     // auto zit = thrust::make_zip_iterator(thrust::make_tuple(d_pairs_tag.begin(), d_pairs.begin(), C_targetTile.begin()));
+    //     // thrust::stable_sort(ASYNC_EXEC_POLICY(STREAM_C), zit, zit + d_pairs_tag.size());
+    //     thrust::reduce_by_key(ASYNC_EXEC_POLICY(STREAM_C), d_pairs_tag.begin(), d_pairs_tag.end(), thrust::make_constant_iterator<int>(1), d_pairs_tag_keys.begin(), d_pairs_tag_offset.begin());
+    //     thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_C), d_pairs_tag_offset.begin(), d_pairs_tag_offset.end(), d_pairs_tag_offset.begin());
+    // }
 
 #ifdef DEBUG_12
     std::jthread DEBUG_12([&]{
@@ -2128,7 +2201,7 @@ int main(int argc, char *argv[]) {
 
     rmm::device_vector<TileCSR_C_rev<ValueType>> Ctiles(_C_tileColIdx.size(), SPGEMM_STREAM_ALLOCATOR_TILECSRC_REV(STREAM_C));
     rmm::device_vector<int> _C_perTileNnz(_C_tileColIdx.size() + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
-    
+
     int numBlocksPerSm_aC = 0;
     int numThreads_aC = 128;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm_aC, (void*)allocate_C<ValueType>, numThreads_aC, 0);
@@ -2157,6 +2230,25 @@ int main(int argc, char *argv[]) {
     dim3 threads_aC {numThreads_aC};
     dim3 blocks_aC {numBlocksPerSm_aC * deviceProp.multiProcessorCount};
     CHECK_CUDA( cudaLaunchCooperativeKernel((void*)allocate_C<ValueType>, blocks_aC, threads_aC, args, 0, STREAM_C) )
+
+    // dim3 threads_aC {128};
+    // dim3 blocks_aC {(d_pairs.size()+3)/4};
+    // allocate_C<<<blocks_aC, threads_aC, 0, STREAM_C>>>
+    // (
+    //     d_pairs.data().get(),
+    //     d_pairs.size(),
+    //     Ctiles.data().get(),
+    //     C_targetTile.data().get(),
+    //     Atiles.data().get(),
+    //     Btiles.data().get()
+    // );
+    // allocate_C_setNnz<<<blocks_aC, threads_aC, 0, STREAM_C>>>
+    // (
+    //     Ctiles.data().get(),
+    //     Ctiles.size(),
+    //     _C_perTileNnz.data().get()
+    // );
+
     thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_C), _C_perTileNnz.begin(), _C_perTileNnz.end(), _C_perTileNnz.begin());
 
     rmm::device_vector<ValueType> Ctiles_vals(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_VALUETYPE(STREAM_C));
@@ -2179,7 +2271,7 @@ int main(int argc, char *argv[]) {
 
     dim3 threads_Cs {numThreads_Cs};
     dim3 blocks_Cs {numBlocksPerSm_Cs * deviceProp.multiProcessorCount};
-    CHECK_CUDA( cudaLaunchCooperativeKernel((void*)C_setOffsets<ValueType>, blocks_Cs, threads_Cs, args_2, 0, STREAM_C) ); // change blocks and threads later?
+    CHECK_CUDA( cudaLaunchCooperativeKernel((void*)C_setOffsets<ValueType>, blocks_Cs, threads_Cs, args_2, 0, STREAM_C) );
 
 #ifdef DEBUG_7
     std::jthread DEBUG_7([&](){
@@ -2188,19 +2280,18 @@ int main(int argc, char *argv[]) {
         outfile.open(filename, std::ios::out);
 
         cudaStreamSynchronize(STREAM_C);
-        thrustHvec<TileCSR_C_rev<ValueType>> hCtiles(Ctiles.size());
-        thrustHvec<int> hCperTileNnz(_C_perTileNnz.size());
+        thrustHvecPin<TileCSR_C_rev<ValueType>> hCtiles(Ctiles.size());
+        thrustHvecPin<int> hCperTileNnz(_C_perTileNnz.size());
         thrust::copy(Ctiles.begin(), Ctiles.end(), hCtiles.begin());
         thrust::copy(_C_perTileNnz.begin(), _C_perTileNnz.end(), hCperTileNnz.begin());
         
-        outfile << "]\n" << std::endl;
-        outfile << "Ctiles: [(y, x)" << std::endl;
+        outfile << "Ctiles: [(y, x)\n";
         for(int i = 0; i < hCtiles.size(); ++i) {
-            printInfo2(outfile, hCtiles[i], 256);
+            printInfo2(outfile, hCtiles[i], hCperTileNnz[i+1]-hCperTileNnz[i]);
         }
-        outfile << "]" << std::endl;
+        outfile << "]\n";
 
-        outfile << "\n\nperTileNnz:\n";
+        outfile << "\nperTileNnz:\n";
         auto print = [&outfile] (auto v) { outfile << v << " "; };
         std::for_each(hCperTileNnz.begin(), hCperTileNnz.end(), print);
 
@@ -2208,6 +2299,22 @@ int main(int argc, char *argv[]) {
     });
 #endif
 
+    std::cout << "\nACCUMULATOR PHASE\n";
+    dim3 threads_mp {128};
+    dim3 blocks_mp {((d_pairs.size()-1+threads_mp.x/threads_mp.x)+3)/4};
+
+    multiply_pairs_default<ValueType><<<blocks_mp, threads_mp, 0, STREAM_C>>>
+    (
+        d_pairs.data().get(),
+        d_pairs.size(),
+        Ctiles.data().get(),
+        _C_perTileNnz.data().get(),
+        C_targetTile.data().get(),
+        Atiles.data().get(),
+        A_perTileNnz.data().get(),
+        Btiles.data().get(),
+        B_perTileNnz.data().get()
+    );
 
 #ifdef DEBUG_10
     std::jthread DEBUG_10([&]{
@@ -2220,218 +2327,17 @@ int main(int argc, char *argv[]) {
 
         thrustHvecPin<TileCSR_C_rev<ValueType>> hCtiles = Ctiles;
         thrustHvecPin<int> hCtilesNnz = _C_perTileNnz;
+        thrustHvecPin<uint8_t> hCrowColidx = Ctiles_rowColIdx;
+        thrustHvecPin<ValueType> hCvals = Ctiles_vals;
         for(int n = 0; n < hCtiles.size(); ++n)
         {
             outfile << "TILE " << n << "\n";
-            printInfo(outfile, hCtiles[n], hCtilesNnz[n+1] - hCtilesNnz[n]);
+            printInfo(outfile, hCtiles[n], hCvals.data()+hCtilesNnz[n], hCrowColidx.data() + hCtilesNnz[n],  hCtilesNnz[n+1] - hCtilesNnz[n]);
             outfile << "\n";
         }
         outfile.close();
     });
 #endif  
-
-    std::cout << "\nACCUMULATOR PHASE\n";
-    dim3 threads_mp {128};
-    dim3 blocks_mp {((d_pairs.size()-1+threads_mp.x/threads_mp.x)+3)/4};
-
-    multiply_pairs_default<ValueType, 16><<<blocks_mp, threads_mp, 0, STREAM_C>>>
-    (
-        d_pairs.data().get(),
-        d_pairs.size(),
-        Ctiles.data().get(),
-        _C_perTileNnz.data().get(),
-        C_targetTile.data().get(),
-        Atiles.data().get(),
-        A_perTileNnz.data().get(),
-        Btiles.data().get(),
-        B_perTileNnz.data().get()
-    );
-    // for(int i = 0; i < 6; ++i)
-    // {
-    //     if(d_pairs_tag_keys[i] == -1) break;
-    //     int d_pairs_size = d_pairs_tag_offset[i+1]-d_pairs_tag_offset[i];
-    //     std::cout << "Key: " << d_pairs_tag_keys[i] << " counts: " << d_pairs_size << "\n";
-    //     switch(d_pairs_tag_keys[i])
-    //     {
-    //         case 0:
-    //         {
-    //             // dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
-    //             // multiply_pairs_register_cache<<<blocks_mp, threads_mp, 0, STREAM_C>>>
-    //             // (
-    //             //     d_pairs.data().get() + d_pairs_tag_offset[i],
-    //             //     d_pairs_size,
-    //             //     Ctiles.data().get(),
-    //             //     _C_perTileNnz.data().get(),
-    //             //     C_targetTile.data().get(),
-    //             //     Atiles.data().get(),
-    //             //     A_perTileNnz.data().get(),
-    //             //     Btiles.data().get(),
-    //             //     B_perTileNnz.data().get()
-    //             // );
-    //             // std::cout << "Register cache accumulator launched\n";
-    //             dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
-    //             multiply_pairs_default<ValueType, 16><<<blocks_mp, threads_mp, 0, STREAM_C>>>
-    //             (
-    //                 d_pairs.data().get() + d_pairs_tag_offset[i],
-    //                 d_pairs_size,
-    //                 Ctiles.data().get(),
-    //                 _C_perTileNnz.data().get(),
-    //                 C_targetTile.data().get(),
-    //                 Atiles.data().get(),
-    //                 A_perTileNnz.data().get(),
-    //                 Btiles.data().get(),
-    //                 B_perTileNnz.data().get()
-    //             );
-    //             std::cout << "Default accumulator-16 launched\n\n";
-    //         }
-    //         break;
-
-    //         case 1:
-    //         {
-    //             dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
-    //             multiply_pairs_default<ValueType, 32><<<blocks_mp, threads_mp, 0, STREAM_C>>>
-    //             (
-    //                 d_pairs.data().get() + d_pairs_tag_offset[i],
-    //                 d_pairs_size,
-    //                 Ctiles.data().get(),
-    //                 _C_perTileNnz.data().get(),
-    //                 C_targetTile.data().get(),
-    //                 Atiles.data().get(),
-    //                 A_perTileNnz.data().get(),
-    //                 Btiles.data().get(),
-    //                 B_perTileNnz.data().get()
-    //             );
-    //             std::cout << "Default accumulator-32 launched\n\n";
-    //         }
-    //         break;
-
-    //         case 2:
-    //         {
-    //             dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
-    //             multiply_pairs_default<ValueType, 64><<<blocks_mp, threads_mp, 0, STREAM_C>>>
-    //             (
-    //                 d_pairs.data().get() + d_pairs_tag_offset[i],
-    //                 d_pairs_size,
-    //                 Ctiles.data().get(),
-    //                 _C_perTileNnz.data().get(),
-    //                 C_targetTile.data().get(),
-    //                 Atiles.data().get(),
-    //                 A_perTileNnz.data().get(),
-    //                 Btiles.data().get(),
-    //                 B_perTileNnz.data().get()
-    //             );
-    //             std::cout << "Default accumulator-64 launched\n\n";
-    //         }
-    //         break;
-
-    //         case 3:
-    //         {
-    //             dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
-    //             multiply_pairs_default<ValueType, 128><<<blocks_mp, threads_mp, 0, STREAM_C>>>
-    //             (
-    //                 d_pairs.data().get() + d_pairs_tag_offset[i],
-    //                 d_pairs_size,
-    //                 Ctiles.data().get(),
-    //                 _C_perTileNnz.data().get(),
-    //                 C_targetTile.data().get(),
-    //                 Atiles.data().get(),
-    //                 A_perTileNnz.data().get(),
-    //                 Btiles.data().get(),
-    //                 B_perTileNnz.data().get()
-    //             );
-    //             std::cout << "Default accumulator-128 launched\n\n";
-    //         }
-    //         break;
-
-    //         case 4:
-    //         {
-    //             dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
-    //             multiply_pairs_default<ValueType, 192><<<blocks_mp, threads_mp, 0, STREAM_C>>>
-    //             (
-    //                 d_pairs.data().get() + d_pairs_tag_offset[i],
-    //                 d_pairs_size,
-    //                 Ctiles.data().get(),
-    //                 _C_perTileNnz.data().get(),
-    //                 C_targetTile.data().get(),
-    //                 Atiles.data().get(),
-    //                 A_perTileNnz.data().get(),
-    //                 Btiles.data().get(),
-    //                 B_perTileNnz.data().get()
-    //             );
-    //             std::cout << "Default accumulator-192 launched\n\n";
-    //         }
-    //         break;
-
-    //         case 5:
-    //         {
-    //             // dim3 blocks_mp {(d_pairs_size-1+threads_mp.x)/threads_mp.x};
-    //             // // cudaFuncSetSharedMemConfig((void*)multiply_pairs_tensor<double>, cudaSharedMemBankSizeEightByte);
-    //             // multiply_pairs_tensor<double><<<blocks_mp, threads_mp, 0, STREAM_C>>>
-    //             // (
-    //             //     d_pairs.data().get() + d_pairs_tag_offset[i],
-    //             //     d_pairs_size,
-    //             //     Ctiles.data().get(),
-    //             //     _C_perTileNnz.data().get(),
-    //             //     C_targetTile.data().get(),
-    //             //     Atiles.data().get(),
-    //             //     A_perTileNnz.data().get(),
-    //             //     Btiles.data().get(),
-    //             //     B_perTileNnz.data().get()
-    //             // );
-    //             dim3 blocks_mp {(((d_pairs_size-1+threads_mp.x)/threads_mp.x)+3)/4};
-    //             multiply_pairs_default<ValueType, 256><<<blocks_mp, threads_mp, 0, STREAM_C>>>
-    //             (
-    //                 d_pairs.data().get() + d_pairs_tag_offset[i],
-    //                 d_pairs_size,
-    //                 Ctiles.data().get(),
-    //                 _C_perTileNnz.data().get(),
-    //                 C_targetTile.data().get(),
-    //                 Atiles.data().get(),
-    //                 A_perTileNnz.data().get(),
-    //                 Btiles.data().get(),
-    //                 B_perTileNnz.data().get()
-    //             );
-    //             std::cout << "Tensor Core accumulator launched\n\n";
-    //         }
-    //         break;
-
-    //         default:
-    //         continue;
-    //     }
-    // }
-
-    // auto arg1 = d_pairs.data().get();
-    // auto arg2 = d_pairs.size();
-    // auto arg3 =  Ctiles.data().get();
-    // auto arg4 =  _C_perTileNnz.data().get();
-    // auto arg5 = C_targetTile.data().get();
-    // auto arg6 =  Atiles.data().get();
-    // auto arg7 =  A_perTileNnz.data().get();
-    // auto arg8 =  Btiles.data().get();
-    // auto arg9 =  B_perTileNnz.data().get();
-    
-    // // cudaStreamSynchronize(STREAM_B);
-
-    // void *kernArgs[] = {
-    //     static_cast<void*>(&arg1),
-    //     static_cast<void*>(&arg2),
-    //     static_cast<void*>(&arg3),
-    //     static_cast<void*>(&arg4),
-    //     static_cast<void*>(&arg5),
-    //     static_cast<void*>(&arg6),
-    //     static_cast<void*>(&arg7),
-    //     static_cast<void*>(&arg8),
-    //     static_cast<void*>(&arg9),
-    // };
-
-    // int numBlocksPerSm_mp = 0;
-    // int numThreads_mp = 128;
-    // cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm_mp, (void*)multiply_pairs<ValueType>, numThreads_mp, sizeof(TileCSR_rev<ValueType>) * 8);
-    // std::cout << "multiply_pairs Max block count per SM with 128 threads: " << numBlocksPerSm_mp << "\n";
-
-    // dim3 threads_mp {numThreads_mp};
-    // dim3 blocks_mp {numBlocksPerSm_mp * deviceProp.multiProcessorCount};
-    // CHECK_CUDA( cudaLaunchCooperativeKernel((void*)multiply_pairs_default<ValueType,256>, blocks_mp, threads_mp, kernArgs, sizeof(TileCSR_rev<ValueType>) * 8, STREAM_C) )
 
 
 #ifdef DEBUG_11
@@ -2463,13 +2369,15 @@ int main(int argc, char *argv[]) {
     });
 #endif
 
-    // cudaStreamSynchronize(STREAM_C);
     cudaDeviceSynchronize();
     std::cout << "C nnz: " << _C_perTileNnz.back() << "\n";
 
-    // std::quick_exit(0);
-    // std::atexit([]{cudaDeviceReset();});
-    // return 0; // <--------------------------------------------------------------------------------------------------------------------------------
+    if(!atoi(argv[2]))
+    {
+        std::cout << "Not saving results. Exiting.\n";
+        std::atexit([]{cudaDeviceReset();});
+        return 0;
+    }
 
     rmm::device_vector<int> Crows(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
     rmm::device_vector<int> Ccols(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
@@ -2487,6 +2395,7 @@ int main(int argc, char *argv[]) {
         Ctiles.size(),
         _C_tilePtr.data().get(),
         _C_tilePtr.size(), 
+        _C_tileRowIdx.data().get(),
         _C_tileColIdx.data().get(), 
         _C_perTileNnz.data().get()
     );
@@ -2496,40 +2405,54 @@ int main(int argc, char *argv[]) {
     thrust::stable_sort(ASYNC_EXEC_POLICY(STREAM_C), zit, zit + _C_perTileNnz.back());
     }
 
-    if(atoi(argv[2]))
-    {
-        std::cout << "Saving results to SPGEMM_RESULT_*.txt\n";
+    std::cout << "Saving results to /tmp/SPGEMM_RESULT_*.txt\n";
 
-        char const *filename1 = "../src/DEBUG/SPGEMM_RESULT_Crows.txt";
-        char const *filename2 = "../src/DEBUG/SPGEMM_RESULT_Ccols.txt";
-        char const *filename3 = "../src/DEBUG/SPGEMM_RESULT_Cvals.txt";
-        std::ofstream outfile;
+    char const *filename0 = "/tmp/SPGEMM_RESULT_NNZ.txt";
+    char const *filename1 = "/tmp/SPGEMM_RESULT_ROWS.txt";
+    char const *filename2 = "/tmp/SPGEMM_RESULT_COLS.txt";
+    char const *filename3 = "/tmp/SPGEMM_RESULT_VALS.txt";
+    char const *filename4 = "/tmp/SPGEMM_RESULT_COMBINE.txt";
 
-        auto print = [&outfile] (auto v) { outfile << v << " "; };
-        
-        thrustHvec<int> hCrows(Crows.size());
-        thrustHvec<int> hCcols(Ccols.size());
-        thrustHvec<ValueType> hCvals(Cvals.size());
+    std::ofstream outfile;
 
-        cudaStreamSynchronize(STREAM_C);
-        thrust::copy(Crows.begin(), Crows.end(), hCrows.begin());
-        thrust::copy(Ccols.begin(), Ccols.end(), hCcols.begin());
-        thrust::copy(Cvals.begin(), Cvals.end(), hCvals.begin());
+    auto print = [&outfile] (auto v) { outfile << v << "\n"; };
+    auto print2 = [&outfile] (auto v) { outfile << v << " "; };
+    
+    thrustHvec<int> hCrows(Crows.size());
+    thrustHvec<int> hCcols(Ccols.size());
+    thrustHvec<ValueType> hCvals(Cvals.size());
 
-        // outfile << "MATRIX C -- RESULT\n";
-        outfile.open(filename1, std::ios::out);
-        outfile << "rows:\n";
-        std::for_each(hCrows.begin(), hCrows.end(), print);
-        outfile.close();
-        outfile.open(filename2, std::ios::out);
-        outfile << "\n\ncols:\n";
-        std::for_each(hCcols.begin(), hCcols.end(), print);
-        outfile.close();
-        outfile.open(filename3, std::ios::out);
-        outfile << "\n\nvals:\n";
-        std::for_each(hCvals.begin(), hCvals.end(), print);
-        outfile.close();
-    }
+    cudaStreamSynchronize(STREAM_C);
+    thrust::copy(Crows.begin(), Crows.end(), hCrows.begin());
+    thrust::copy(Ccols.begin(), Ccols.end(), hCcols.begin());
+    thrust::copy(Cvals.begin(), Cvals.end(), hCvals.begin());
+
+    outfile.open(filename4, std::ios::out);
+    outfile << "Rows\n";
+    std::for_each(hCrows.begin(), hCrows.end(), print2);
+    outfile << "\nCols\n";
+    std::for_each(hCcols.begin(), hCcols.end(), print2);
+    outfile << "\nVals\n";
+    outfile << std::fixed << std::setprecision(std::numeric_limits<double>::max_digits10);
+    std::for_each(hCvals.begin(), hCvals.end(), print2);
+    outfile.close();
+
+    outfile.open(filename0, std::ios::out);
+    outfile << _C_perTileNnz.back();
+    outfile.close();
+
+    outfile.open(filename1, std::ios::out);
+    std::for_each(hCrows.begin(), hCrows.end(), print);
+    outfile.close();
+
+    outfile.open(filename2, std::ios::out);
+    std::for_each(hCcols.begin(), hCcols.end(), print);
+    outfile.close();
+
+    outfile.open(filename3, std::ios::out);
+    outfile << std::fixed << std::setprecision(std::numeric_limits<double>::max_digits10);
+    std::for_each(hCvals.begin(), hCvals.end(), print);
+    outfile.close();
 
     // std::quick_exit(0);
     std::atexit([]{cudaDeviceReset();});
