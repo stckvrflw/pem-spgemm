@@ -2,11 +2,10 @@
 #### **WORK IN PROGRESS**
 Final Assignment Project - SpGEMM algorithm in CUDA
 
-Original idea from [1]
+Inspirations from [1]
 
 A Sparse General Matrix-Matrix Multiplication (SpGEMM) implementation.  
 Implemented it my own way from scratch with custom optimization and changes in CUDA C++20.
-Makes extensive use of cooperative groups.
 
 Libraries used:
 * [cx.h][ansorge]
@@ -26,9 +25,9 @@ Environment:
 * CPU       : 11th Gen Intel(R) Core(TM) i7-11800H
 * GPU       : NVIDIA Corporation GA104M [GeForce RTX 3080 Mobile / Max-Q 8GB/16GB]
 * OS        : Gentoo Linux
-* Kernel    : 6.12.16-gentoo
+* Kernel    : 6.13.8-zen1
 * CUDA      : 12.8
-* driver    : 570.124.04
+* driver    : 570.144
 * gcc       : 14.2.1 20241221
 
 [ansorge]: https://github.com/RichardAns/CUDA-Programs
@@ -37,7 +36,3 @@ Environment:
 [cusparse]: https://developer.nvidia.com/cusparse
 [fmm]: https://github.com/alugowski/fast_matrix_market
 [suitesparse]: https://sparse.tamu.edu
-
-
-#### TODO:
-* finish the project

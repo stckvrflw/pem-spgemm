@@ -8,6 +8,7 @@ Author: Petrus E. Manurung
 #include <fstream>
 #include <thread>
 #include <algorithm>
+#include <chrono>
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/scan.h>
@@ -219,8 +220,6 @@ __transpose_B_mask
     {
         uint16_t tile_mask[16];
         *(reinterpret_cast<ulonglong4*>(tile_mask)) = *(reinterpret_cast<ulonglong4 const*>(Btiles[idx].mask));
-        // #pragma unroll
-        // for(int n = 0; n < 16; ++n) tile_mask[n] = Btiles[idx].mask[n];
         
         #pragma unroll
         for(int m = 0; m < 16; ++m)
@@ -234,9 +233,6 @@ __transpose_B_mask
             thread_buf[m] = temp;
         }
         *(reinterpret_cast<ulonglong4*>(&Btiles_transposed_mask[(idx*16)])) = *(reinterpret_cast<ulonglong4*>(thread_buf));
-
-        // #pragma unroll
-        // for(int n = 0; n < 16; ++n) Btiles_transposed_mask[idx*16+n] = thread_buf[n];
 
         idx += (gridDim.x << 8);
     }
@@ -626,11 +622,11 @@ C_setOffsets
     auto block = cg::this_thread_block();
     auto warp = cg::tiled_partition<32>(block);
 
-    auto local_group = cg::tiled_partition<16>(warp); // meta group rank 0 -> row, 1 -> col, 0 loads from A, 1 from B
+    auto local_group = cg::tiled_partition<16>(warp);
     int lgmgr = local_group.meta_group_rank();
     int lgtr = local_group.thread_rank();
 
-    int local_group_Ctiles_idx_start = grid.block_rank() * 4 * 2 + warp.meta_group_rank() * 2 + lgmgr;
+    int local_group_Ctiles_idx_start = (grid.block_rank() << 3) + (warp.meta_group_rank() << 1) + lgmgr;
     while(local_group_Ctiles_idx_start < Ctiles_size) 
     {
         unsigned my_Cmask = Ctiles[local_group_Ctiles_idx_start].mask[lgtr / 2];
@@ -641,7 +637,6 @@ C_setOffsets
             Ctiles[local_group_Ctiles_idx_start].rowColIdx = Ctiles_rowColIdx + Ctile_offset;
             Ctiles[local_group_Ctiles_idx_start].vals = Ctiles_vals + Ctile_offset;
         });
-        local_group.sync();
 
         int my_offset = cg::exclusive_scan(local_group, __popc(my_Cmask));
 
@@ -780,7 +775,8 @@ multiply_pairs_default // gt 16 lte 64 lte 96 lte 128 lte 192
     cr_Ptr<int> _A_perTileNnz,
 
     cr_Ptr<TileCSR_rev<ValueType,tileSize>> Btiles,
-    cr_Ptr<int> _B_perTileNnz
+    cr_Ptr<int> _B_perTileNnz,
+    cr_Ptr<uint16_t> Btiles_transposed_mask
 )
 {
     using IdxType = uint8_t;
@@ -822,31 +818,18 @@ multiply_pairs_default // gt 16 lte 64 lte 96 lte 128 lte 192
         }
         __syncwarp();
 
-        unsigned thread_mask = warp_tile_mask[warp_mgr][halfwarp_mgr ^ 0x1][halfwarp_tr];
-        // tranpose tile B's mask
-        if(halfwarp_mgr == 1)
-        {
-            thread_mask = 0;
-            #pragma unroll
-            for(int r = 0; r < 16; ++r)
-            thread_mask |= (((warp_tile_mask[warp_mgr][1][r] >> halfwarp_tr) & 0x1) << r);
-            warp_tile_mask[warp_mgr][1][halfwarp_tr] = thread_mask;
-        }
-        __syncwarp();
 
+        int A = (d_pairs[warp_pairs_idx_start] >> 32);
+        int B = (d_pairs[warp_pairs_idx_start] & 0xFFFFFFFF);
         // calculate elements mask
         for(int n = warp_tr; n < tileC_nnz; n+=32) 
         {
             int r = warp_tileC_rowColIdx[warp_mgr][n] >> 4;
             int c = warp_tileC_rowColIdx[warp_mgr][n] & 0xF;
-            warp_elems_mask[warp_mgr][n] = warp_tile_mask[warp_mgr][0][r] & warp_tile_mask[warp_mgr][1][c];
+            warp_elems_mask[warp_mgr][n] = warp_tile_mask[warp_mgr][0][r] & Btiles_transposed_mask[(B<<4)+c];
         }
         __syncwarp();
-        if(halfwarp_mgr == 0) warp_tile_mask[warp_mgr][1][halfwarp_tr] = thread_mask;
-        __syncwarp();
 
-        int A = (d_pairs[warp_pairs_idx_start] >> 32);
-        int B = (d_pairs[warp_pairs_idx_start] & 0xFFFFFFFF);
         // calculate C
         for(int n = warp_tr; n < tileC_nnz; n+=32)
         {
@@ -1340,6 +1323,12 @@ int main(int argc, char *argv[]) {
     });
 #endif
 
+    cudaEvent_t A_tileConversion_start, A_tileConversion_end, B_tileConversion_start, B_tileConversion_end;
+    cudaEventCreate(&A_tileConversion_start);
+    cudaEventCreate(&A_tileConversion_end);
+    cudaEventCreate(&B_tileConversion_start);
+    cudaEventCreate(&B_tileConversion_end);
+
     dim3 A_threads_gtc {tileSize * tileSize};
     dim3 A_blocks_gtc {cntA};
 
@@ -1350,6 +1339,7 @@ int main(int argc, char *argv[]) {
     A_d_cols(1, A_cols, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_A)), 
     A_participating_tiles_size(1, cntA, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_A));
 
+    cudaEventRecord(A_tileConversion_start, STREAM_A);
     generate_tiles_csr<ValueType><<<A_blocks_gtc, A_threads_gtc,0, STREAM_A>>>
     (
         Atiles.data().get(), 
@@ -1363,6 +1353,7 @@ int main(int argc, char *argv[]) {
         A_d_rowPtr.data().get(),
         A_rows
     );
+    cudaEventRecord(A_tileConversion_end, STREAM_A);
 
     dim3 B_threads_gtc {tileSize * tileSize};
     dim3 B_blocks_gtc {cntB};
@@ -1374,6 +1365,7 @@ int main(int argc, char *argv[]) {
     B_d_cols(1, B_cols, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_B)), 
     B_participating_tiles_size(1, cntB, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_B));
 
+    cudaEventRecord(B_tileConversion_start, STREAM_B);
     generate_tiles_csr<ValueType><<<B_blocks_gtc, B_threads_gtc,0, STREAM_B>>>
     (
         Btiles.data().get(),
@@ -1387,6 +1379,7 @@ int main(int argc, char *argv[]) {
         B_d_rowPtr.data().get(),
         B_rows
     );
+    cudaEventRecord(B_tileConversion_end, STREAM_B);
 
     rmm::device_vector<uint16_t> Btiles_transposed_mask(cntB * 16, SPGEMM_STREAM_ALLOCATOR_UINT16(STREAM_B));
     dim3 threads_tBm {256};
@@ -1634,18 +1627,48 @@ int main(int argc, char *argv[]) {
     });
 #endif
     
+    // transpose _B
+    rmm::device_vector<int> _B_tileOffsets(cntB, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
+    thrust::sequence(ASYNC_EXEC_POLICY(STREAM_E), _B_tileOffsets.begin(), _B_tileOffsets.end());
+    thrust::transform(ASYNC_EXEC_POLICY(STREAM_E), B_participating_tiles.begin(), B_participating_tiles.end(), B_participating_tiles.begin(), swap32());
+    {
+    auto zit = thrust::make_zip_iterator(thrust::make_tuple(B_participating_tiles.begin(), _B_tileOffsets.begin()));
+    thrust::sort(ASYNC_EXEC_POLICY(STREAM_E), zit, zit+B_participating_tiles.size());
+    }
+
+    rmm::device_vector<int> _B_tileColPtr_tmp(B_tileCols, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
+    rmm::device_vector<int> _B_tileColPtr(B_tileCols + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
+    rmm::device_vector<int> _B_tileRowIdx(cntB, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
+    auto newendBB = thrust::reduce_by_key(
+        ASYNC_EXEC_POLICY(STREAM_E),
+        thrust::make_transform_iterator(B_participating_tiles.begin(), getHigh32()),
+        thrust::make_transform_iterator(B_participating_tiles.end(), getHigh32()),
+        thrust::make_constant_iterator<int>(1),
+        _B_tileRowIdx.begin(), // borrow _B_tileRowIdx as temporary index buffer
+        _B_tileColPtr_tmp.begin()
+    );
+    thrust::scatter(ASYNC_EXEC_POLICY(STREAM_E), _B_tileColPtr_tmp.begin(), newendBB.second, _B_tileRowIdx.begin(), _B_tileColPtr.begin());
+    thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_E), _B_tileColPtr.begin(), _B_tileColPtr.end(), _B_tileColPtr.begin());
+    thrust::copy(
+        ASYNC_EXEC_POLICY(STREAM_E),
+        thrust::make_transform_iterator(B_participating_tiles.begin(), getLow32()),
+        thrust::make_transform_iterator(B_participating_tiles.end(), getLow32()),
+        _B_tileRowIdx.begin()
+    );
+
     cudaStreamSynchronize(STREAM_D);
     rmm::device_vector<long long>().swap(A_participating_tiles);
     rmm::device_vector<int>().swap(_A_tileRowPtr_tmp);
     cudaStreamSynchronize(STREAM_E);
-    // rmm::device_vector<long long>().swap(B_participating_tiles);
-    // rmm::device_vector<int>().swap(_B_tileRowPtr_tmp);
+    rmm::device_vector<long long>().swap(B_participating_tiles);
+    rmm::device_vector<int>().swap(_B_tileRowPtr_tmp);
 
     rmm::device_vector<int> 
     _C_tilePtr(SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C)), 
     _C_tileColIdx(SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C)),
     _C_tileRowIdx(SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
 
+    auto pem_spgemm_start = std::chrono::high_resolution_clock::now();
     cusparse_highLevelMultiply
     (
         _A_tileRowPtr.data().get(),
@@ -1702,42 +1725,6 @@ int main(int argc, char *argv[]) {
     });
 #endif
 
-    cudaStreamSynchronize(STREAM_C);
-    std::cout << "\nCtiles: " <<  _C_tilePtr.back() << "\n";
-
-    // transpose _B
-    rmm::device_vector<int> _B_tileOffsets(cntB, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
-    thrust::sequence(ASYNC_EXEC_POLICY(STREAM_E), _B_tileOffsets.begin(), _B_tileOffsets.end());
-    thrust::transform(ASYNC_EXEC_POLICY(STREAM_E), B_participating_tiles.begin(), B_participating_tiles.end(), B_participating_tiles.begin(), swap32());
-    {
-    auto zit = thrust::make_zip_iterator(thrust::make_tuple(B_participating_tiles.begin(), _B_tileOffsets.begin()));
-    thrust::sort(ASYNC_EXEC_POLICY(STREAM_E), zit, zit+B_participating_tiles.size());
-    }
-
-    rmm::device_vector<int> _B_tileColPtr_tmp(B_tileCols, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
-    rmm::device_vector<int> _B_tileColPtr(B_tileCols + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
-    rmm::device_vector<int> _B_tileRowIdx(cntB, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_E));
-    auto newendBB = thrust::reduce_by_key(
-        ASYNC_EXEC_POLICY(STREAM_E),
-        thrust::make_transform_iterator(B_participating_tiles.begin(), getHigh32()),
-        thrust::make_transform_iterator(B_participating_tiles.end(), getHigh32()),
-        thrust::make_constant_iterator<int>(1),
-        _B_tileRowIdx.begin(), // borrow _B_tileRowIdx as temporary index buffer
-        _B_tileColPtr_tmp.begin()
-    );
-    thrust::scatter(ASYNC_EXEC_POLICY(STREAM_E), _B_tileColPtr_tmp.begin(), newendBB.second, _B_tileRowIdx.begin(), _B_tileColPtr.begin());
-    thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_E), _B_tileColPtr.begin(), _B_tileColPtr.end(), _B_tileColPtr.begin());
-    thrust::copy(
-        ASYNC_EXEC_POLICY(STREAM_E),
-        thrust::make_transform_iterator(B_participating_tiles.begin(), getLow32()),
-        thrust::make_transform_iterator(B_participating_tiles.end(), getLow32()),
-        _B_tileRowIdx.begin()
-    );
-
-    cudaStreamSynchronize(STREAM_E);
-    rmm::device_vector<long long>().swap(B_participating_tiles);
-    rmm::device_vector<int>().swap(_B_tileRowPtr_tmp);
-
 #ifdef DEBUG_6
     std::jthread DEBUG_6([&](){
         {
@@ -1785,16 +1772,10 @@ int main(int argc, char *argv[]) {
 
     dim3 threads_sp{256};
     dim3 blocks_sp{(_C_tilePtr.back()-1+threads_sp.x)/threads_sp.x};
-
-    // std::cout <<"\nSEARCH PAIRS DEBUGGING\n";
-    // printf("_C_tileColIdx size: %d\n_A_tileColIdx size: %d\n_B_tileRowIdx size: %d\n_C_tileRowIdx size: %d\n",
-    // _C_tileColIdx.size(), _A_tileColIdx.size(), _B_tileRowIdx.size(), _C_tileRowIdx.size());
-    // std::cout << "_B_tileColPtr.back() " << _B_tileColPtr.back() << "\n";
     
     int *d_pairs_count, *h_pairs_count;
     cudaMallocAsync(&d_pairs_count, sizeof(int), STREAM_C);
     h_pairs_count = new int;
-    cudaStreamSynchronize(STREAM_E);
     search_pairs<0><<<blocks_sp, threads_sp, 0, STREAM_C>>>
     (
         nullptr,
@@ -2019,7 +2000,7 @@ int main(int argc, char *argv[]) {
     });
 #endif
 
-    std::cout << "\nACCUMULATOR PHASE\n";
+    std::cout << "\nACCUMULATOR PHASE\n\n\n";
     dim3 threads_mp {128};
     dim3 blocks_mp {((d_pairs.size()-1+threads_mp.x/threads_mp.x)+3)/4};
 
@@ -2033,7 +2014,8 @@ int main(int argc, char *argv[]) {
         Atiles.data().get(),
         A_perTileNnz.data().get(),
         Btiles.data().get(),
-        B_perTileNnz.data().get()
+        B_perTileNnz.data().get(),
+        Btiles_transposed_mask.data().get()
     );
 
 #ifdef DEBUG_10
@@ -2090,6 +2072,19 @@ int main(int argc, char *argv[]) {
 #endif
 
     cudaDeviceSynchronize();
+    auto pem_spgemm_end = std::chrono::high_resolution_clock::now();
+    auto pem_spgemm_duration = std::chrono::duration<double, std::milli>(pem_spgemm_end-pem_spgemm_start);
+    
+    float Aconversion, Bconversion;
+    cudaEventElapsedTime(&Aconversion, A_tileConversion_start, A_tileConversion_end);
+    cudaEventElapsedTime(&Bconversion, B_tileConversion_start, B_tileConversion_end);
+    
+    std::cout << "<---Program done--->\n";
+    std::cout << "Matrix A CSR to tile conversion took " << Aconversion << " ms\n";
+    std::cout << "Matrix B CSR to tile conversion took " << Bconversion << " ms\n";
+    std::cout << "PEM-SPGEMM took " << std::fixed << std::setprecision(2) 
+    << pem_spgemm_duration.count() << " ms\n";
+    std::cout << "C tiles: " << Ctiles.size() << "\n";
     std::cout << "C nnz: " << _C_perTileNnz.back() << "\n";
 
     if(!atoi(argv[2]))
@@ -2174,7 +2169,12 @@ int main(int argc, char *argv[]) {
     std::for_each(hCvals.begin(), hCvals.end(), print);
     outfile.close();
 
-    // std::quick_exit(0);
+
+    cudaEventDestroy(A_tileConversion_start);
+    cudaEventDestroy(A_tileConversion_end);
+    cudaEventDestroy(B_tileConversion_start);
+    cudaEventDestroy(B_tileConversion_end);
+
     std::atexit([]{cudaDeviceReset();});
     return 0; // <--------------------------------------------------------------------------------------------------------------------------------
 
