@@ -1,5 +1,5 @@
 # pem-spgemm
-#### **WORK IN PROGRESS**
+#### **RELEASE CANDIDATE**
 Final Assignment Project - SpGEMM algorithm in CUDA
 
 Inspirations from [1]
