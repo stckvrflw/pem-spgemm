@@ -394,7 +394,6 @@ int cusparse_highLevelMultiply
     return C_nnz1;
 }
 
-__device__ cuda::atomic<int, cuda::thread_scope_device> pairs_idx(0);
 template<int pass>
 __device__ __forceinline__
 // we iterate on lane_iter, search on lane_targ
@@ -411,7 +410,8 @@ int __find_pairs
     int iter_offset,
     int targ_offset,
     int AorB,
-    cr_Ptr<int> B_tileOffsets
+    cr_Ptr<int> B_tileOffsets,
+    int insertion_start
 )
 {
     int __local_count = 0; // for use when pass = 0 only
@@ -425,11 +425,11 @@ int __find_pairs
                 if(!AorB) // meaning its B, need to swap-- order is AB
                 std::swap(first, second);
                 second = B_tileOffsets[second];
-                int targ_idx = pairs_idx.fetch_add(1, cuda::memory_order_relaxed);
-                // pairs[targ_idx] = ((static_cast<long long>(first) << 32) | second);
+                int targ_idx = insertion_start;
                 pairs_a[targ_idx] = first;
                 pairs_b[targ_idx] = second;
                 C_targetTile[targ_idx] = t_start;
+                ++insertion_start;
             }
             else // 0 = first pass, only count how many are there
             ++__local_count;
@@ -455,7 +455,8 @@ search_pairs
     int C_colIdx_size,
     cr_Ptr<int> B_tileOffsets,
     cr_Ptr<int> C_rowIdx,
-    int *__restrict__ pairs_counter
+    int *__restrict__ pairs_counter,
+    r_Ptr<int> pairs_insertion_offset
 )
 {
     auto grid = cg::this_grid();
@@ -476,17 +477,21 @@ search_pairs
 
         if constexpr(pass == 0) 
         {
+        int curr_count = 0;
         if(AorB)
-        __first_pass_thread_counter += __find_pairs<0>(nullptr, nullptr, C_targetTile, t_start, A_colIdx_segment, A_colIdx_segment_len, B_rowIdx_segment, B_rowIdx_segment_len, A_rowPtr[t_C_row], B_colPtr[t_C_col], AorB, B_tileOffsets);
+        curr_count = __find_pairs<0>(nullptr, nullptr, C_targetTile, t_start, A_colIdx_segment, A_colIdx_segment_len, B_rowIdx_segment, B_rowIdx_segment_len, A_rowPtr[t_C_row], B_colPtr[t_C_col], AorB, B_tileOffsets, 0);
         else
-        __first_pass_thread_counter += __find_pairs<0>(nullptr, nullptr, C_targetTile, t_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[t_C_col], A_rowPtr[t_C_row], AorB, B_tileOffsets);
+        curr_count = __find_pairs<0>(nullptr, nullptr, C_targetTile, t_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[t_C_col], A_rowPtr[t_C_row], AorB, B_tileOffsets, 0);
+        
+        pairs_insertion_offset[t_start] = curr_count;
+        __first_pass_thread_counter += curr_count;
         }
         else 
         {
         if(AorB)
-        __find_pairs<1>(pairs_a, pairs_b, C_targetTile, t_start, A_colIdx_segment, A_colIdx_segment_len, B_rowIdx_segment, B_rowIdx_segment_len, A_rowPtr[t_C_row], B_colPtr[t_C_col], AorB, B_tileOffsets);
+        __find_pairs<1>(pairs_a, pairs_b, C_targetTile, t_start, A_colIdx_segment, A_colIdx_segment_len, B_rowIdx_segment, B_rowIdx_segment_len, A_rowPtr[t_C_row], B_colPtr[t_C_col], AorB, B_tileOffsets, pairs_insertion_offset[t_start]);
         else
-        __find_pairs<1>(pairs_a, pairs_b, C_targetTile, t_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[t_C_col], A_rowPtr[t_C_row], AorB, B_tileOffsets);
+        __find_pairs<1>(pairs_a, pairs_b, C_targetTile, t_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[t_C_col], A_rowPtr[t_C_row], AorB, B_tileOffsets, pairs_insertion_offset[t_start]);
         }
         
         t_start += grid.num_threads();
@@ -593,10 +598,6 @@ allocate_C
     int quarter_local_group_pairs_idx_start = grid.block_rank() * 16 + (threadIdx.x >> 3);
     while(quarter_local_group_pairs_idx_start < d_pairs_size) 
     {
-    //     int quarter_local_group_tile_idx_A = (d_pairs[quarter_local_group_pairs_idx_start] >> 32);
-    //     int quarter_local_group_tile_idx_B = (d_pairs[quarter_local_group_pairs_idx_start] & 0xFFFFFFFF);
-
-        
         int quarter_local_group_tile_idx_A = d_pairs_a[quarter_local_group_pairs_idx_start];
         int quarter_local_group_tile_idx_B = d_pairs_b[quarter_local_group_pairs_idx_start];
 
@@ -791,7 +792,6 @@ multiply_pairs_default
 (
     cr_Ptr<int> d_pairs_a,
     cr_Ptr<int> d_pairs_b,
-    int d_pairs_size,
     
     r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
     int Ctiles_size,
@@ -799,13 +799,10 @@ multiply_pairs_default
     cr_Ptr<int> C_targetTiles,
 
     cr_Ptr<TileCSR_rev<ValueType,tileSize>> Atiles,
-    cr_Ptr<int> _A_perTileNnz,
-
     cr_Ptr<TileCSR_rev<ValueType,tileSize>> Btiles,
-    cr_Ptr<int> _B_perTileNnz,
+
     cr_Ptr<uint16_t> Btiles_transposed_mask,
-    cr_Ptr<int> C_targetTiles_offset,
-    cr_Ptr<int> C_targetTile_tile
+    cr_Ptr<int> C_targetTiles_offset
 )
 {
     using IdxType = uint8_t;
@@ -1036,8 +1033,6 @@ enum STREAMS {
     STREAME,
     STREAMS_COUNT,
 };
-
-// #define DEBUG_12
 
 int main(int argc, char *argv[]) {
     if(argc <= 1 || argc > 3) {
@@ -1366,6 +1361,11 @@ int main(int argc, char *argv[]) {
     _C_tileColIdx(SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C)),
     _C_tileRowIdx(SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
 
+    cudaEvent_t accumulator_start;
+    cudaEvent_t accumulator_end;
+    cudaEventCreate(&accumulator_start);
+    cudaEventCreate(&accumulator_end);
+
     auto pem_spgemm_start = std::chrono::high_resolution_clock::now();
     cusparse_highLevelMultiply
     (
@@ -1385,16 +1385,8 @@ int main(int argc, char *argv[]) {
         STREAM_C,
         ASYNC_EXEC_POLICY(STREAM_C)
     );
-
-    // {
-    // auto zit = thrust::make_zip_iterator(thrust::make_tuple(_C_tileRowIdx.begin(), _C_tileColIdx.begin()));
-    // thrust::stable_sort(ASYNC_EXEC_POLICY(STREAM_C), zit, zit+_C_tileRowIdx.size());
-    // }
     
     std::cout << "\nCOUNTING PAIRS\n";
-
-    cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, 0);
 
     dim3 threads_sp{256};
     dim3 blocks_sp{(_C_tilePtr.back()-1+threads_sp.x)/threads_sp.x};
@@ -1402,6 +1394,7 @@ int main(int argc, char *argv[]) {
     int *d_pairs_count, *h_pairs_count;
     cudaMallocAsync(&d_pairs_count, sizeof(int), STREAM_C);
     h_pairs_count = new int;
+    rmm::device_vector<int> pairs_insertion_offset(_C_tilePtr.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
     search_pairs<0><<<blocks_sp, threads_sp, 0, STREAM_C>>>
     (
         nullptr,
@@ -1417,11 +1410,14 @@ int main(int argc, char *argv[]) {
         _C_tileColIdx.size(),
         _B_tileOffsets.data().get(),
         _C_tileRowIdx.data().get(),
-        d_pairs_count
+        d_pairs_count,
+        pairs_insertion_offset.data().get()
     );
     cudaMemcpyAsync(h_pairs_count, d_pairs_count, sizeof(int), cudaMemcpyDeviceToHost, STREAM_C);
     cudaStreamSynchronize(STREAM_C);
     std::cout << "Pairs count: " << *h_pairs_count << "\n";
+
+    thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_C), pairs_insertion_offset.begin(), pairs_insertion_offset.end(), pairs_insertion_offset.begin());
 
     rmm::device_vector<int> d_pairs_a(*h_pairs_count);
     rmm::device_vector<int> d_pairs_b(*h_pairs_count);
@@ -1441,37 +1437,9 @@ int main(int argc, char *argv[]) {
         _C_tileColIdx.size(),
         _B_tileOffsets.data().get(),
         _C_tileRowIdx.data().get(),
-        d_pairs_count
+        d_pairs_count,
+        pairs_insertion_offset.data().get()
     );
-    
-
-#ifdef DEBUG_12
-    std::jthread DEBUG_12([&]{
-        cudaStreamSynchronize(STREAM_C);
-        char const *filename = "../src/DEBUG/DEBUG_12";
-        std::ofstream outfile;
-        outfile.open(filename, std::ios::out);
-
-        outfile << "DEBUG 12\n";
-
-        outfile << "KEYS\n";
-        // for(auto i = d_pairs_tag_keys.begin(); i < d_pairs_newend.first; ++i) outfile << *i << "\n";
-        for(int i = 0; i < 6; ++i) outfile << d_pairs_tag_keys[i] << "\n";
-        outfile << "COUNTS\n";
-        // for(auto i = d_pairs_tag_counts.begin(); i < d_pairs_newend.second; ++i) outfile << *i << "\n";
-        for(int i = 0; i < 7; ++i) outfile << d_pairs_tag_offset[i] << "\n";
-
-        outfile << "\nPAIRS_TAG\n";
-        // thrust::host_vector<uint8_t> h_pairs_tag = d_pairs_tag;
-        // for(int i = 0; i < h_pairs_tag.size(); ++i)
-        // {
-        //     outfile << static_cast<int>(h_pairs_tag[i]) << " ";
-        //     if((i+1) % 512 == 0) outfile << "\n";
-        // }
-
-        outfile.close();
-    });
-#endif
 
     rmm::device_vector<TileCSR_C_rev<ValueType>> Ctiles(_C_tileColIdx.size(), SPGEMM_STREAM_ALLOCATOR_TILECSRC_REV(STREAM_C));
     rmm::device_vector<int> _C_perTileNnz(_C_tileColIdx.size() + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
@@ -1505,6 +1473,9 @@ int main(int argc, char *argv[]) {
         static_cast<void*>(&args88)
     };
 
+
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, 0);
     dim3 threads_aC {numThreads_aC};
     dim3 blocks_aC {numBlocksPerSm_aC * deviceProp.multiProcessorCount};
     CHECK_CUDA( cudaLaunchCooperativeKernel((void*)allocate_C<ValueType>, blocks_aC, threads_aC, args, 0, STREAM_C) )
@@ -1535,35 +1506,24 @@ int main(int argc, char *argv[]) {
 
     std::cout << "\nACCUMULATOR PHASE\n\n\n";
 
-    rmm::device_vector<int> C_targetTile_offset(Ctiles.size()+1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
-    rmm::device_vector<int> C_targetTile_tile(Ctiles.size(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
-    {
-        auto zit = thrust::make_zip_iterator(thrust::make_tuple(C_targetTile.begin(), d_pairs_a.begin(), d_pairs_b.begin()));
-        thrust::stable_sort(ASYNC_EXEC_POLICY(STREAM_C), zit, zit+*h_pairs_count);
-        thrust::reduce_by_key(ASYNC_EXEC_POLICY(STREAM_C), C_targetTile.begin(),C_targetTile.end(), thrust::make_constant_iterator<int>(1), C_targetTile_tile.begin(), C_targetTile_offset.begin());
-        thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_C), C_targetTile_offset.begin(), C_targetTile_offset.end(), C_targetTile_offset.begin());
-    }
-    cudaDeviceSynchronize();
     dim3 threads_mp {128};
     dim3 blocks_mp {((Ctiles.size()-1+threads_mp.x/threads_mp.x)+3)/4};
 
+    cudaEventRecord(accumulator_start, STREAM_C);
     multiply_pairs_default<ValueType><<<blocks_mp, threads_mp, 0, STREAM_C>>>
     (
         d_pairs_a.data().get(),
         d_pairs_b.data().get(),
-        d_pairs_a.size(),
         Ctiles.data().get(),
         Ctiles.size(),
         _C_perTileNnz.data().get(),
         C_targetTile.data().get(),
         Atiles.data().get(),
-        A_perTileNnz.data().get(),
         Btiles.data().get(),
-        B_perTileNnz.data().get(),
         Btiles_transposed_mask.data().get(),
-        C_targetTile_offset.data().get(),
-        C_targetTile_tile.data().get()
+        pairs_insertion_offset.data().get()
     );
+    cudaEventRecord(accumulator_end, STREAM_C);
 
     cudaDeviceSynchronize();
     auto pem_spgemm_end = std::chrono::high_resolution_clock::now();
@@ -1572,12 +1532,15 @@ int main(int argc, char *argv[]) {
     float Aconversion, Bconversion;
     cudaEventElapsedTime(&Aconversion, A_tileConversion_start, A_tileConversion_end);
     cudaEventElapsedTime(&Bconversion, B_tileConversion_start, B_tileConversion_end);
+
+    float accumulator_time;
+    cudaEventElapsedTime(&accumulator_time, accumulator_start, accumulator_end);
     
     std::cout << "<---Program done--->\n";
     std::cout << "Matrix A CSR to tile conversion took " << Aconversion << " ms\n";
     std::cout << "Matrix B CSR to tile conversion took " << Bconversion << " ms\n";
-    std::cout << "PEM-SPGEMM took " << std::fixed << std::setprecision(2) 
-    << pem_spgemm_duration.count() << " ms\n";
+    std::cout << "Accumulator took " << accumulator_time << " ms\n";
+    std::cout << "PEM-SPGEMM took " << std::fixed << std::setprecision(2) << pem_spgemm_duration.count() << " ms\n";
     std::cout << "C tiles: " << Ctiles.size() << "\n";
     std::cout << "C nnz: " << _C_perTileNnz.back() << "\n";
 
