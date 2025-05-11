@@ -1394,7 +1394,7 @@ int main(int argc, char *argv[]) {
     int *d_pairs_count, *h_pairs_count;
     cudaMallocAsync(&d_pairs_count, sizeof(int), STREAM_C);
     h_pairs_count = new int;
-    rmm::device_vector<int> pairs_insertion_offset(_C_tilePtr.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
+    rmm::device_vector<int> pairs_insertion_offset(_C_tilePtr.back()+1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
     search_pairs<0><<<blocks_sp, threads_sp, 0, STREAM_C>>>
     (
         nullptr,
