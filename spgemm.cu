@@ -381,6 +381,7 @@ __device__ __forceinline__
 // we iterate on lane_iter, search on lane_targ
 int __find_pairs
 (
+    auto warp,
     r_Ptr<int> pairs_a,
     r_Ptr<int> pairs_b,
     r_Ptr<int> C_targetTile,
@@ -397,24 +398,35 @@ int __find_pairs
 )
 {
     int __local_count = 0; // for use when pass = 0 only
-    for(int i = 0; i < lane_iter_len; ++i) {
+    for(int i = warp.thread_rank(); i < lane_iter_len; i+=32) {
+        auto coal = cg::coalesced_threads();
         int found = binarySearch(lane_targ, lane_iter[i], lane_targ_len);
+        
+        if constexpr(pass == 1)
+        {
+        coal.sync();
+        }
         if(found != -1) {
             if constexpr(pass == 1) // 1 = second pass
             {   
-                int first = iter_offset + i;
-                int second = targ_offset + found;
-                if(!AorB) // meaning its B, need to swap-- order is AB
-                std::swap(first, second);
-                second = B_tileOffsets[second];
-                int targ_idx = insertion_start;
-                pairs_a[targ_idx] = first;
-                pairs_b[targ_idx] = second;
-                C_targetTile[targ_idx] = t_start;
-                ++insertion_start;
+            auto coalesced = cg::coalesced_threads();
+            int first = iter_offset + i;
+            int second = targ_offset + found;
+            if(!AorB) // meaning its B, need to swap-- order is AB
+            std::swap(first, second);
+            second = B_tileOffsets[second];
+            int targ_idx = insertion_start + coalesced.thread_rank();
+            pairs_a[targ_idx] = first;
+            pairs_b[targ_idx] = second;
+            C_targetTile[targ_idx] = t_start;
+            insertion_start+=coalesced.num_threads();
             }
             else // 0 = first pass, only count how many are there
             ++__local_count;
+        }
+        if constexpr(pass == 1)
+        {
+        insertion_start = cg::reduce(coal, insertion_start, cg::greater<int>());
         }
     }
     return __local_count;
@@ -439,37 +451,36 @@ search_pairs
     r_Ptr<int> pairs_insertion_offset
 )
 {
-    auto grid = cg::this_grid();
-
-    int t_start = grid.thread_rank();
-    while(t_start < C_colIdx_size) {
-        int t_C_col = C_colIdx[t_start];
-        int t_C_row = C_rowIdx[t_start];
-        decltype(A_colIdx) A_colIdx_segment = A_colIdx + A_rowPtr[t_C_row];
-        decltype(B_rowIdx) B_rowIdx_segment = B_rowIdx + B_colPtr[t_C_col];
-        int A_colIdx_segment_len = A_rowPtr[t_C_row + 1] - A_rowPtr[t_C_row];
-        int B_rowIdx_segment_len = B_colPtr[t_C_col + 1] - B_colPtr[t_C_col];
+    auto warp = cg::tiled_partition<32>(cg::this_thread_block());
+    int w_start = (blockIdx.x << 3) + (threadIdx.x >> 5);
+    while(w_start < C_colIdx_size) {
+        int w_C_col = C_colIdx[w_start];
+        int w_C_row = C_rowIdx[w_start];
+        decltype(A_colIdx) A_colIdx_segment = A_colIdx + A_rowPtr[w_C_row];
+        decltype(B_rowIdx) B_rowIdx_segment = B_rowIdx + B_colPtr[w_C_col];
+        int A_colIdx_segment_len = A_rowPtr[w_C_row + 1] - A_rowPtr[w_C_row];
+        int B_rowIdx_segment_len = B_colPtr[w_C_col + 1] - B_colPtr[w_C_col];
         int AorB = A_colIdx_segment_len <= B_rowIdx_segment_len ? 1 : 0; // A = 1; B = 0;
 
         if constexpr(pass == 0) 
         {
         int curr_count = 0;
         if(AorB)
-        curr_count = __find_pairs<0>(nullptr, nullptr, C_targetTile, t_start, A_colIdx_segment, A_colIdx_segment_len, B_rowIdx_segment, B_rowIdx_segment_len, A_rowPtr[t_C_row], B_colPtr[t_C_col], AorB, B_tileOffsets, 0);
+        curr_count = __find_pairs<0>(warp, nullptr, nullptr, C_targetTile, w_start, A_colIdx_segment, A_colIdx_segment_len, B_rowIdx_segment, B_rowIdx_segment_len, A_rowPtr[w_C_row], B_colPtr[w_C_col], AorB, B_tileOffsets, 0);
         else
-        curr_count = __find_pairs<0>(nullptr, nullptr, C_targetTile, t_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[t_C_col], A_rowPtr[t_C_row], AorB, B_tileOffsets, 0);
+        curr_count = __find_pairs<0>(warp, nullptr, nullptr, C_targetTile, w_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[w_C_col], A_rowPtr[w_C_row], AorB, B_tileOffsets, 0);
         
-        pairs_insertion_offset[t_start] = curr_count;
+        cg::reduce_store_async(warp, &pairs_insertion_offset[w_start], curr_count, cg::plus<int>());
         }
         else 
         {
         if(AorB)
-        __find_pairs<1>(pairs_a, pairs_b, C_targetTile, t_start, A_colIdx_segment, A_colIdx_segment_len, B_rowIdx_segment, B_rowIdx_segment_len, A_rowPtr[t_C_row], B_colPtr[t_C_col], AorB, B_tileOffsets, pairs_insertion_offset[t_start]);
+        __find_pairs<1>(warp ,pairs_a, pairs_b, C_targetTile, w_start, A_colIdx_segment, A_colIdx_segment_len, B_rowIdx_segment, B_rowIdx_segment_len, A_rowPtr[w_C_row], B_colPtr[w_C_col], AorB, B_tileOffsets, pairs_insertion_offset[w_start]);
         else
-        __find_pairs<1>(pairs_a, pairs_b, C_targetTile, t_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[t_C_col], A_rowPtr[t_C_row], AorB, B_tileOffsets, pairs_insertion_offset[t_start]);
+        __find_pairs<1>(warp, pairs_a, pairs_b, C_targetTile, w_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[w_C_col], A_rowPtr[w_C_row], AorB, B_tileOffsets, pairs_insertion_offset[w_start]);
         }
         
-        t_start += grid.num_threads();
+        w_start += (gridDim.x << 3);
     }
 }
 
@@ -1163,6 +1174,7 @@ int main(int argc, char *argv[]) {
     cudaEventCreate(&high_level_multiply_end);
     cudaEventCreate(&allocate_c_start);
     cudaEventCreate(&allocate_c_end);
+    // cudaEventCreate(&accumulator_start);
     cudaEventCreate(&accumulator_end);
 
     dim3 A_threads_gtc {tileSize * tileSize};
@@ -1397,9 +1409,6 @@ int main(int argc, char *argv[]) {
     auto args8 =  Btiles.data().get();
     auto args88 = Btiles_transposed_mask.data().get();
     auto args888 = pairs_insertion_offset.data().get();
-
-    cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, 0);
 
     dim3 threads_aC {128};
     dim3 blocks_aC {(Ctiles.size()-1+threads_aC.x)/threads_aC.x};
