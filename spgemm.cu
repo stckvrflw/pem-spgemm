@@ -327,7 +327,7 @@ int cusparse_highLevelMultiply
                                spgemmDesc, &bufferSize2, NULL) )
     CHECK_CUDA( cudaMallocAsync((void**) &dBuffer2, bufferSize2, stream) )
     
-    cudaEventRecord(start);
+    cudaEventRecord(start, stream);
     // compute the intermediate product of A * B
     CHECK_CUSPARSE( cusparseSpGEMM_compute(handle, opA, opB,
                                            &alpha, matA, matB, &beta, matC,
@@ -358,7 +358,7 @@ int cusparse_highLevelMultiply
                             computeType, CUSPARSE_SPGEMM_DEFAULT, spgemmDesc) )
 
     CHECK_CUSPARSE( cusparseXcsr2coo(handle, dC_csrOffsets, C_nnz1, C_num_rows1, dC_rows, CUSPARSE_INDEX_BASE_ZERO) )
-    cudaEventRecord(end);
+    cudaEventRecord(end, stream);
 
     *d_CtileColIdx = dC_rows;
     *d_CtileRowIdx = dC_columns;
@@ -385,7 +385,7 @@ int __find_pairs
     r_Ptr<int> pairs_a,
     r_Ptr<int> pairs_b,
     r_Ptr<int> C_targetTile,
-    int t_start,
+    int w_start,
     cr_Ptr<int> lane_iter,
     int lane_iter_len,
     cr_Ptr<int> lane_targ,
@@ -399,34 +399,34 @@ int __find_pairs
 {
     int __local_count = 0; // for use when pass = 0 only
     for(int i = warp.thread_rank(); i < lane_iter_len; i+=32) {
-        auto coal = cg::coalesced_threads();
+        auto loop_participants = cg::coalesced_threads();
         int found = binarySearch(lane_targ, lane_iter[i], lane_targ_len);
         
         if constexpr(pass == 1)
         {
-        coal.sync();
+        loop_participants.sync();
         }
         if(found != -1) {
             if constexpr(pass == 1) // 1 = second pass
             {   
-            auto coalesced = cg::coalesced_threads();
+            auto lucky_ones = cg::coalesced_threads();
             int first = iter_offset + i;
             int second = targ_offset + found;
             if(!AorB) // meaning its B, need to swap-- order is AB
             std::swap(first, second);
             second = B_tileOffsets[second];
-            int targ_idx = insertion_start + coalesced.thread_rank();
+            int targ_idx = insertion_start + lucky_ones.thread_rank();
             pairs_a[targ_idx] = first;
             pairs_b[targ_idx] = second;
-            C_targetTile[targ_idx] = t_start;
-            insertion_start+=coalesced.num_threads();
+            C_targetTile[targ_idx] = w_start;
+            insertion_start+=lucky_ones.num_threads();
             }
             else // 0 = first pass, only count how many are there
             ++__local_count;
         }
         if constexpr(pass == 1)
         {
-        insertion_start = cg::reduce(coal, insertion_start, cg::greater<int>());
+        insertion_start = cg::reduce(loop_participants, insertion_start, cg::greater<int>());
         }
     }
     return __local_count;
@@ -1163,7 +1163,7 @@ int main(int argc, char *argv[]) {
 
     cudaEvent_t A_tileConversion_start, A_tileConversion_end, B_tileConversion_start, B_tileConversion_end;
     cudaEvent_t high_level_multiply_start, high_level_multiply_end;
-    cudaEvent_t allocate_c_start, allocate_c_end;
+    cudaEvent_t allocate_c_start, sp0_end, sp1_start, sp1_end, aC_start, aC_end, setOffset_start, allocate_c_end;
     cudaEvent_t accumulator_end;
 
     cudaEventCreate(&A_tileConversion_start);
@@ -1173,6 +1173,12 @@ int main(int argc, char *argv[]) {
     cudaEventCreate(&high_level_multiply_start);
     cudaEventCreate(&high_level_multiply_end);
     cudaEventCreate(&allocate_c_start);
+    cudaEventCreate(&sp0_end);
+    cudaEventCreate(&sp1_start);
+    cudaEventCreate(&sp1_end);
+    cudaEventCreate(&aC_start);
+    cudaEventCreate(&aC_end);
+    cudaEventCreate(&setOffset_start);
     cudaEventCreate(&allocate_c_end);
     // cudaEventCreate(&accumulator_start);
     cudaEventCreate(&accumulator_end);
@@ -1324,7 +1330,7 @@ int main(int argc, char *argv[]) {
     int *_C_tileColIdx, *_C_tileRowIdx;
 
     auto pem_spgemm_start = std::chrono::high_resolution_clock::now();
-
+    // cudaEventRecord(high_level_multiply_start, STREAM_C);
     int _C_nnz = cusparse_highLevelMultiply
     (
         _A_tileRowPtr.data().get(),
@@ -1345,6 +1351,7 @@ int main(int argc, char *argv[]) {
         high_level_multiply_start,
         high_level_multiply_end
     );
+    // cudaEventRecord(high_level_multiply_end, STREAM_C);
     
     std::cout << "\nCOUNTING PAIRS\n";
     dim3 threads_sp{256};
@@ -1352,7 +1359,7 @@ int main(int argc, char *argv[]) {
 
     rmm::device_vector<int> pairs_insertion_offset(_C_nnz+1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
 
-    cudaEventRecord(allocate_c_start);
+    cudaEventRecord(allocate_c_start, STREAM_C);
     search_pairs<0><<<blocks_sp, threads_sp, 0, STREAM_C>>>
     (
         nullptr,
@@ -1370,19 +1377,20 @@ int main(int argc, char *argv[]) {
         pairs_insertion_offset.data().get()
     );
     thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_C), pairs_insertion_offset.begin(), pairs_insertion_offset.end(), pairs_insertion_offset.begin());
+    cudaEventRecord(sp0_end, STREAM_C);
 
-    cudaStreamSynchronize(STREAM_C);
-    std::cout << "Pairs count: " << pairs_insertion_offset.back() << "\n";
+    int *d_pairs_a, *d_pairs_b, *C_targetTile;
+    cudaMallocAsync(&d_pairs_a, sizeof(int) * pairs_insertion_offset.back(), STREAM_C); 
+    cudaMallocAsync(&d_pairs_b, sizeof(int) * pairs_insertion_offset.back(), STREAM_C); 
+    cudaMallocAsync(&C_targetTile, sizeof(int) * pairs_insertion_offset.back(), STREAM_C); 
 
 
-    rmm::device_vector<int> d_pairs_a(pairs_insertion_offset.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
-    rmm::device_vector<int> d_pairs_b(pairs_insertion_offset.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
-    rmm::device_vector<int> C_targetTile(pairs_insertion_offset.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
+    cudaEventRecord(sp1_start, STREAM_C);
     search_pairs<1><<<blocks_sp, threads_sp, 0, STREAM_C>>>
     (
-        d_pairs_a.data().get(),
-        d_pairs_b.data().get(),
-        C_targetTile.data().get(),
+        d_pairs_a,
+        d_pairs_b,
+        C_targetTile,
         _C_tileColIdx,
         _A_tileRowPtr.data().get(),
         _A_tileColIdx.data().get(),
@@ -1394,33 +1402,25 @@ int main(int argc, char *argv[]) {
         _C_tileRowIdx,
         pairs_insertion_offset.data().get()
     );
+    cudaEventRecord(sp1_end, STREAM_C);
 
-    rmm::device_vector<TileCSR_C_rev<ValueType>> Ctiles(_C_nnz, SPGEMM_STREAM_ALLOCATOR_TILECSRC_REV(STREAM_C));
+    TileCSR_C_rev<ValueType> *Ctiles;
+    cudaMallocAsync(&Ctiles, sizeof(TileCSR_C_rev<ValueType>) * _C_nnz, STREAM_C);
     rmm::device_vector<int> _C_perTileNnz(_C_nnz + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
 
-    auto args1 = d_pairs_a.data().get();
-    auto args11 = d_pairs_b.data().get();
-    auto args2 = d_pairs_a.size();
-    auto args3 =  Ctiles.data().get();
-    auto args4 = Ctiles.size();
-    auto args5 = _C_perTileNnz.data().get();
-    auto args6 = C_targetTile.data().get();
-    auto args7 =  Atiles.data().get();
-    auto args8 =  Btiles.data().get();
-    auto args88 = Btiles_transposed_mask.data().get();
-    auto args888 = pairs_insertion_offset.data().get();
-
     dim3 threads_aC {128};
-    dim3 blocks_aC {(Ctiles.size()-1+threads_aC.x)/threads_aC.x};
+    dim3 blocks_aC {(_C_nnz-1+threads_aC.x)/threads_aC.x};
+
+    cudaEventRecord(aC_start, STREAM_C);
     allocate_C<<<blocks_aC, threads_aC, 0, STREAM_C>>>
     (
-        d_pairs_a.data().get(),
-        d_pairs_b.data().get(),
-        d_pairs_a.size(),
-        Ctiles.data().get(),
-        Ctiles.size(),
+        d_pairs_a,
+        d_pairs_b,
+        pairs_insertion_offset.back(),
+        Ctiles,
+        _C_nnz,
         _C_perTileNnz.data().get(),
-        C_targetTile.data().get(),
+        C_targetTile,
         Atiles.data().get(),
         Btiles.data().get(),
         Btiles_transposed_mask.data().get(),
@@ -1428,35 +1428,41 @@ int main(int argc, char *argv[]) {
     );
 
     thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_C), _C_perTileNnz.begin(), _C_perTileNnz.end(), _C_perTileNnz.begin());
+    cudaEventRecord(aC_end, STREAM_C);
 
-    rmm::device_vector<ValueType> Ctiles_vals(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_VALUETYPE(STREAM_C));
-    rmm::device_vector<uint8_t> Ctiles_rowColIdx(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_UINT8(STREAM_C));
+    ValueType *Ctiles_vals;
+    uint8_t *Ctiles_rowColIdx;
+    cudaMallocAsync(&Ctiles_vals, sizeof(ValueType) * _C_perTileNnz.back(), STREAM_C);
+    cudaMallocAsync(&Ctiles_rowColIdx, sizeof(uint8_t) * _C_perTileNnz.back(), STREAM_C);
 
     dim3 threads_Cs{128};
-    dim3 blocks_Cs{(Ctiles.size()-1+threads_Cs.x)/threads_Cs.x};
+    dim3 blocks_Cs{(_C_nnz-1+threads_Cs.x)/threads_Cs.x};
+
+    cudaEventRecord(setOffset_start, STREAM_C);
     C_setOffsets<<<blocks_Cs, threads_Cs, 0, STREAM_C>>>
     (
-        Ctiles.data().get(),
-        Ctiles.size(),
+        Ctiles,
+        _C_nnz,
         _C_perTileNnz.data().get(),
-        Ctiles_vals.data().get(),
-        Ctiles_rowColIdx.data().get()
+        Ctiles_vals,
+        Ctiles_rowColIdx
     );
     cudaEventRecord(allocate_c_end, STREAM_C);
 
     std::cout << "\nACCUMULATOR PHASE\n\n\n";
 
     dim3 threads_mp {128};
-    dim3 blocks_mp {(Ctiles.size()+3)/4};
+    dim3 blocks_mp {(_C_nnz+3)/4};
 
+    // cudaEventRecord(accumulator_start, STREAM_C);
     multiply_pairs_default<ValueType><<<blocks_mp, threads_mp, 0, STREAM_C>>>
     (
-        d_pairs_a.data().get(),
-        d_pairs_b.data().get(),
-        Ctiles.data().get(),
-        Ctiles.size(),
+        d_pairs_a,
+        d_pairs_b,
+        Ctiles,
+        _C_nnz,
         _C_perTileNnz.data().get(),
-        C_targetTile.data().get(),
+        C_targetTile,
         Atiles.data().get(),
         Btiles.data().get(),
         Btiles_transposed_mask.data().get(),
@@ -1472,10 +1478,20 @@ int main(int argc, char *argv[]) {
     cudaEventElapsedTime(&Aconversion, A_tileConversion_start, A_tileConversion_end);
     cudaEventElapsedTime(&Bconversion, B_tileConversion_start, B_tileConversion_end);
 
-    float hlm_time, allocate_c_time, accumulator_time;
+    float hlm_time, sp0_time, sp1_time, aC_time, sO_time, accumulator_time;
     cudaEventElapsedTime(&hlm_time, high_level_multiply_start, high_level_multiply_end);
-    cudaEventElapsedTime(&allocate_c_time, allocate_c_start, allocate_c_end);
+    // cudaEventElapsedTime(&allocate_c_time, allocate_c_start, allocate_c_end);
+    cudaEventElapsedTime(&sp0_time, allocate_c_start, sp0_end);
+    cudaEventElapsedTime(&sp1_time, sp1_start, sp1_end);
+    cudaEventElapsedTime(&aC_time, aC_start, aC_end);
+    cudaEventElapsedTime(&sO_time, setOffset_start, allocate_c_end);
     cudaEventElapsedTime(&accumulator_time, allocate_c_end, accumulator_end);
+
+    float allocate_c_time = sp0_time + sp1_time + aC_time + sO_time;
+
+    float pem_spgemm_time = pem_spgemm_duration.count();
+    float kernel_time = hlm_time + allocate_c_time + accumulator_time;
+    float malloc_time = pem_spgemm_time - kernel_time;
     
     std::cout << "<---Program done--->\n";
     std::cout << "Matrix A CSR to tile conversion took " << Aconversion << "ms\n";
@@ -1485,8 +1501,9 @@ int main(int argc, char *argv[]) {
     std::cout << "Allocating C took " << allocate_c_time << "ms\n";
     std::cout << "Accumulator took " << accumulator_time << "ms\n\n";
     
-    std::cout << "PEM-SPGEMM took " << std::fixed << std::setprecision(2) << pem_spgemm_duration.count() << "ms\n";
-    std::cout << "C tiles: " << Ctiles.size() << "\n";
+    std::cout << "PEM-SPGEMM took " << std::fixed << std::setprecision(2) 
+    << pem_spgemm_time << "ms\nKernel time " << kernel_time << "ms\nmalloc time " << malloc_time << "ms\n";
+    std::cout << "C tiles: " << _C_nnz << "\n";
     std::cout << "C nnz: " << _C_perTileNnz.back() << "\n";
 
     if(!atoi(argv[2]))
@@ -1501,15 +1518,15 @@ int main(int argc, char *argv[]) {
     rmm::device_vector<ValueType> Cvals(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_VALUETYPE(STREAM_C));
 
     dim3 threads_sC {tileSize * tileSize};
-    dim3 blocks_sC {(Ctiles.size()+7)/8};
+    dim3 blocks_sC {(_C_nnz+7)/8};
 
     sanitize_C<<<blocks_sC, threads_sC, 0, STREAM_C>>>
     (
         Crows.data().get(), 
         Ccols.data().get(), 
         Cvals.data().get(), 
-        Ctiles.data().get(), 
-        Ctiles.size(),
+        Ctiles, 
+        _C_nnz,
         _C_tileRowIdx,
         _C_tileColIdx, 
         _C_perTileNnz.data().get()
@@ -1576,6 +1593,13 @@ int main(int argc, char *argv[]) {
     cudaEventDestroy(B_tileConversion_end);
     cudaEventDestroy(high_level_multiply_start);
     cudaEventDestroy(high_level_multiply_end);
+    cudaEventDestroy(allocate_c_start);
+    cudaEventDestroy(sp0_end);
+    cudaEventDestroy(sp1_start);
+    cudaEventDestroy(sp1_end);
+    cudaEventDestroy(aC_start);
+    cudaEventDestroy(aC_end);
+    cudaEventDestroy(setOffset_start);
     cudaEventDestroy(allocate_c_end);
     cudaEventDestroy(accumulator_end);
 
