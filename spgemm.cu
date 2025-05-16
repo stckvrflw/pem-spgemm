@@ -13,6 +13,7 @@ Author: Petrus E. Manurung
 #include <cooperative_groups.h>
 #include <cooperative_groups/scan.h>
 #include <cooperative_groups/reduce.h>
+#include <cooperative_groups/memcpy_async.h>
 
 #include <cuda/pipeline>
 #include <mma.h>
@@ -613,6 +614,205 @@ allocate_C
 
 template<typename ValueType, int tileSize = 16>
 __global__ void __launch_bounds__(4 * 32) 
+allocate_C_noshmem
+(
+    cr_Ptr<int> d_pairs_a,
+    cr_Ptr<int> d_pairs_b,
+    int d_pairs_size,
+
+    r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
+    int Ctiles_size,
+    r_Ptr<int> _C_perTileNnz,
+    cr_Ptr<int> C_targetTiles,
+
+    cr_Ptr<TileCSR_rev<ValueType,tileSize>> Atiles,
+    cr_Ptr<TileCSR_rev<ValueType,tileSize>> Btiles,
+    cr_Ptr<uint16_t> Btiles_transposed_mask,
+
+    cr_Ptr<int> pairs_insertion_offset
+)
+{
+    auto grid = cg::this_grid();
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
+    
+    auto isZero = [](unsigned n) __attribute__((always_inline)) { return ((n | (~n + 1)) >> 31) & 1; };
+    auto wt_u32 = []<typename T>(uint64_t global, T val) __attribute__((always_inline)) { asm volatile("st.global.L1::no_allocate.u32 [%0], %1;" : : "l"(global) , "r"(val)); };
+
+
+    int quarter_mgr = threadIdx.x >> 3;
+    int quarter_tr = threadIdx.x % 8;
+    int quarter_group_C_idx = (blockIdx.x << 4) + (threadIdx.x >> 3);
+    auto quarter_group = cg::tiled_partition<8>(warp);
+    while(quarter_group_C_idx < Ctiles_size)
+    {
+        unsigned quarter_tr_Ctiles_mask = 0;
+        int quarter_local_group_pairs_count = pairs_insertion_offset[quarter_group_C_idx+1]-pairs_insertion_offset[quarter_group_C_idx];
+
+        for(int pair = pairs_insertion_offset[quarter_group_C_idx]; pair < pairs_insertion_offset[quarter_group_C_idx] + quarter_local_group_pairs_count; ++pair)
+        {
+            int quarter_local_group_tile_idx_A = d_pairs_a[pair];
+            int quarter_local_group_tile_idx_B = d_pairs_b[pair];
+
+            unsigned C_mask = 0;
+            #pragma unroll
+            for(int n = 0; n < tileSize; ++n) C_mask |= (isZero((Atiles[quarter_local_group_tile_idx_A].mask[quarter_tr<<1] & Btiles_transposed_mask[(quarter_local_group_tile_idx_B<<4) + n])) << n);
+            C_mask <<= 16;
+            #pragma unroll
+            for(int n = 0; n < tileSize; ++n) C_mask |= (isZero((Atiles[quarter_local_group_tile_idx_A].mask[(quarter_tr<<1)+1] & Btiles_transposed_mask[(quarter_local_group_tile_idx_B<<4) +n])) << n);
+
+            quarter_tr_Ctiles_mask |= C_mask;
+        }
+
+        wt_u32((uint64_t)&Ctiles[quarter_group_C_idx].mask[quarter_tr], quarter_tr_Ctiles_mask);
+
+        int tileC_nnz = cg::reduce(quarter_group, __popc(quarter_tr_Ctiles_mask), cg::plus<int>());
+        cg::invoke_one(quarter_group, wt_u32, (uint64_t)(_C_perTileNnz + quarter_group_C_idx), tileC_nnz);
+
+        quarter_group_C_idx += (gridDim.x << 4);
+    }
+}
+
+
+template<typename ValueType, int tileSize = 16>
+__global__ void __launch_bounds__(4 * 32) 
+allocate_C_async
+(
+    cr_Ptr<int> d_pairs_a,
+    cr_Ptr<int> d_pairs_b,
+    int d_pairs_size,
+
+    r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
+    int Ctiles_size,
+    r_Ptr<int> _C_perTileNnz,
+    cr_Ptr<int> C_targetTiles,
+
+    cr_Ptr<TileCSR_rev<ValueType,tileSize>> Atiles,
+    cr_Ptr<TileCSR_rev<ValueType,tileSize>> Btiles,
+    cr_Ptr<uint16_t> Btiles_transposed_mask,
+
+    cr_Ptr<int> pairs_insertion_offset
+)
+{
+    using MaskType = TileCSR_rev<ValueType>::MaskType;
+    __shared__ __align__(16) MaskType quarter_Atiles_mask[16][2][16];
+    __shared__ __align__(16) MaskType quarter_Btiles_transposed_mask[16][2][16];
+    // __shared__ __align__(16) unsigned quarter_Ctiles_mask[16][8];
+    
+    auto isZero = [](unsigned n) __attribute__((always_inline)) { return ((n | (~n + 1)) >> 31) & 1; };
+    auto wt_u8 = [](uint64_t global, uint16_t val) __attribute__((always_inline)) { asm volatile("st.global.L1::no_allocate.u8 [%0], %1;" : : "l"(global) ,"h"(val)); };
+    auto wt_u16 = [](uint64_t global, uint16_t val) __attribute__((always_inline)) { asm volatile("st.global.L1::no_allocate.u16 [%0], %1;" : : "l"(global), "h"(val)); };
+    auto wt_u32 = []<typename T>(uint64_t global, T val) __attribute__((always_inline)) { asm volatile("st.global.L1::no_allocate.u32 [%0], %1;" : : "l"(global) , "r"(val)); };
+
+    cuda::pipeline<cuda::thread_scope_thread> pipeline = cuda::make_pipeline();
+    auto thread = cg::this_thread();
+
+    auto quarter_group = cg::tiled_partition<8>(cg::tiled_partition<32>(cg::this_thread_block()));
+    int volatile quarter_mgr = threadIdx.x >> 3;
+    int volatile quarter_tr = quarter_group.thread_rank();
+    int quarter_group_C_idx = (blockIdx.x << 4) + (threadIdx.x >> 3);
+    while(quarter_group_C_idx < Ctiles_size)
+    {
+        // quarter_Ctiles_mask[quarter_mgr][quarter_tr] = 0;
+        unsigned quarter_tr_Ctiles_mask = 0;
+        int quarter_local_group_pairs_count = pairs_insertion_offset[quarter_group_C_idx+1]-pairs_insertion_offset[quarter_group_C_idx];
+
+        int stage = 0;
+        int pair = pairs_insertion_offset[quarter_group_C_idx];
+        int quarter_local_group_tile_idx_A = d_pairs_a[pair];
+        int quarter_local_group_tile_idx_B = d_pairs_b[pair];
+
+        pipeline.producer_acquire();
+        cuda::memcpy_async(
+            thread, 
+            (unsigned*)&quarter_Atiles_mask[quarter_mgr][stage][quarter_tr<<1], 
+            (unsigned*)&Atiles[quarter_local_group_tile_idx_A].mask[quarter_tr<<1], 
+            sizeof(MaskType) * 2, 
+            pipeline);
+        cuda::memcpy_async(
+            thread, 
+            (unsigned*)&quarter_Btiles_transposed_mask[quarter_mgr][stage][quarter_tr<<1], 
+            (unsigned*)&Btiles_transposed_mask[(quarter_local_group_tile_idx_B<<4)+(quarter_tr<<1)], 
+            sizeof(MaskType) * 2, 
+            pipeline);
+        pipeline.producer_commit();
+        
+        ++pair;
+        quarter_local_group_tile_idx_A = d_pairs_a[pair];
+        quarter_local_group_tile_idx_B = d_pairs_b[pair];
+
+        while(pair < pairs_insertion_offset[quarter_group_C_idx] + quarter_local_group_pairs_count)
+        {
+            pipeline.producer_acquire();
+            cuda::memcpy_async(
+                thread, 
+                (unsigned*)&quarter_Atiles_mask[quarter_mgr][stage^1][quarter_tr<<1], 
+                (unsigned*)&Atiles[quarter_local_group_tile_idx_A].mask[quarter_tr<<1], 
+                sizeof(MaskType) * 2, 
+                pipeline);
+            cuda::memcpy_async(
+                thread, 
+                (unsigned*)&quarter_Btiles_transposed_mask[quarter_mgr][stage^1][quarter_tr<<1], 
+                (unsigned*)&Btiles_transposed_mask[(quarter_local_group_tile_idx_B<<4)+(quarter_tr<<1)], 
+                sizeof(MaskType) * 2, 
+                pipeline);
+            pipeline.producer_commit();
+
+            pipeline.consumer_wait();
+            quarter_group.sync();
+            unsigned C_mask = 0;
+            #pragma unroll
+            for(int n = 0; n < tileSize; ++n) C_mask |= (isZero((quarter_Atiles_mask[quarter_mgr][stage][(quarter_tr<<1)] & quarter_Btiles_transposed_mask[quarter_mgr][stage][n])) << n);
+            C_mask <<= 16;
+            #pragma unroll
+            for(int n = 0; n < tileSize; ++n) C_mask |= (isZero((quarter_Atiles_mask[quarter_mgr][stage][(quarter_tr<<1)+1] & quarter_Btiles_transposed_mask[quarter_mgr][stage][n])) << n);
+            pipeline.consumer_release();
+
+            // quarter_Ctiles_mask[quarter_mgr][quarter_tr] |= C_mask;
+            quarter_tr_Ctiles_mask |= C_mask;
+            stage^=1;
+
+            ++pair;
+            quarter_local_group_tile_idx_A = d_pairs_a[pair];
+            quarter_local_group_tile_idx_B = d_pairs_b[pair];
+        }
+
+        pipeline.consumer_wait();
+        quarter_group.sync();
+        unsigned C_mask = 0;
+        #pragma unroll
+        for(int n = 0; n < tileSize; ++n) C_mask |= (isZero((quarter_Atiles_mask[quarter_mgr][stage][(quarter_tr<<1)] & quarter_Btiles_transposed_mask[quarter_mgr][stage][n])) << n);
+        C_mask <<= 16;
+        #pragma unroll
+        for(int n = 0; n < tileSize; ++n) C_mask |= (isZero((quarter_Atiles_mask[quarter_mgr][stage][(quarter_tr<<1)+1] & quarter_Btiles_transposed_mask[quarter_mgr][stage][n])) << n);
+        pipeline.consumer_release();
+        // quarter_Ctiles_mask[quarter_mgr][quarter_tr] |= C_mask;
+        quarter_tr_Ctiles_mask |= C_mask;
+
+
+
+        // Ctiles[quarter_group_C_idx].mask[quarter_tr] = quarter_Ctiles_mask[quarter_mgr][quarter_tr];
+        // wt_u16((uint64_t)&Ctiles[quarter_group_C_idx].mask[quarter_tr], quarter_Ctiles_mask[quarter_mgr][quarter_tr]);
+
+        // Ctiles[quarter_group_C_idx].mask[quarter_tr] = quarter_tr_Ctiles_mask;
+        wt_u32((uint64_t)&Ctiles[quarter_group_C_idx].mask[quarter_tr], quarter_tr_Ctiles_mask);
+
+        // int tileC_nnz = __popc(quarter_Ctiles_mask[quarter_mgr][quarter_tr]);
+        // cg::reduce_store_async(quarter_group, _C_perTileNnz + quarter_group_C_idx, tileC_nnz, cg::plus<int>());
+        int sum = cg::reduce(quarter_group, __popc(quarter_tr_Ctiles_mask), cg::plus<int>());
+        cg::invoke_one(quarter_group, wt_u32, (uint64_t)(_C_perTileNnz + quarter_group_C_idx), sum);
+
+        // tileC_nnz = cg::exclusive_scan(quarter_group, tileC_nnz);
+        // Ctiles[quarter_group_C_idx].rowPtr[quarter_tr] = tileC_nnz;
+        // wt_u8((uint64_t)&Ctiles[quarter_group_C_idx].rowPtr[quarter_tr], tileC_nnz);
+
+        quarter_group_C_idx += (gridDim.x << 4);
+    }
+}
+
+
+template<typename ValueType, int tileSize = 16>
+__global__ void __launch_bounds__(4 * 32) 
 C_setOffsets
 (
     r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
@@ -655,7 +855,7 @@ C_setOffsets
             }
         }
 
-        local_group_Ctiles_idx_start += grid.num_blocks() * block.num_threads() / local_group.size();
+        local_group_Ctiles_idx_start += (grid.num_blocks() << 3);
     }
 }
 
@@ -783,8 +983,6 @@ multiply_pairs_default
         {
             int A = d_pairs_a[pair];
             int B = d_pairs_b[pair];
-
-            __syncwarp();
 
             // calculate C
             for(int n = warp_tr; n < tileC_nnz; n+=32)
@@ -1407,7 +1605,7 @@ int main(int argc, char *argv[]) {
     dim3 blocks_aC {(_C_nnz+15)/16};
 
     cudaEventRecord(aC_start, STREAM_C);
-    allocate_C<<<blocks_aC, threads_aC, 0, STREAM_C>>>
+    allocate_C_noshmem<<<blocks_aC, threads_aC, 0, STREAM_C>>>
     (
         d_pairs_a,
         d_pairs_b,
