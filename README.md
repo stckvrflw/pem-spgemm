@@ -30,6 +30,11 @@ Environment:
 * driver    : 570.144
 * gcc       : 14.2.1 20241221
 
+How to use:
+* A^2   : ./spgemm "path-to-.mtx-file" [0/1] 
+* A*At  : ./spgemm "path-to-.mtx-file" [0/1] t  
+*** 0 to skip saving to file, 1 to save to file in /tmp
+
 [ansorge]: https://github.com/RichardAns/CUDA-Programs
 [thrust]: https://developer.nvidia.com/thrust
 [rapidsrmm]: https://github.com/rapidsai/rmm
