@@ -758,9 +758,6 @@ multiply_pairs_default
 )
 {
     using IdxType = uint8_t;
-    using MaskType = uint16_t;
-
-    __shared__ MaskType warp_tile_mask      [4][2][16];
     __shared__ IdxType warp_tileC_rowColIdx [4][256];
 
     int volatile warp_tr = threadIdx.x % 32;
@@ -784,8 +781,6 @@ multiply_pairs_default
 
         for(int pair = C_targetTiles_offset[warp_tileC_idx]; pair < C_targetTiles_offset[warp_tileC_idx] + d_pairs_count; ++pair) 
         {
-            warp_tile_mask[warp_mgr][halfwarp_mgr][halfwarp_tr] = halfwarp_tile[halfwarp_pairs[pair]].mask[halfwarp_tr];
-
             int A = d_pairs_a[pair];
             int B = d_pairs_b[pair];
 
@@ -797,12 +792,12 @@ multiply_pairs_default
                 ValueType sum = 0;
                 int r = warp_tileC_rowColIdx[warp_mgr][n] >> 4;
                 int c = warp_tileC_rowColIdx[warp_mgr][n] & 0xF;
-                unsigned my_mask = warp_tile_mask[warp_mgr][0][r] & Btiles_transposed_mask[(B<<4)+c];
+                unsigned my_mask = Atiles[A].mask[r] & Btiles_transposed_mask[(B<<4)+c];
                 while(my_mask)
                 {
                     int ffs = __ffs(my_mask)-1;
-                    int A_offset = __popc( warp_tile_mask[warp_mgr][0][r] & (0xFFFFU >> (16-ffs)) );
-                    int B_offset = __popc( warp_tile_mask[warp_mgr][1][ffs] & (0xFFFFU >> (16-c)) );
+                    int A_offset = __popc( Atiles[A].mask[r] & (0xFFFFU >> (16-ffs)) );
+                    int B_offset = __popc( Btiles[B].mask[ffs] & (0xFFFFU >> (16-c)) );
                     sum += Atiles[A].vals[Atiles[A].rowPtr[r]+A_offset] * Btiles[B].vals[Btiles[B].rowPtr[ffs]+B_offset];
 
                     my_mask &= (~(1 << (ffs)));
@@ -1409,7 +1404,7 @@ int main(int argc, char *argv[]) {
     rmm::device_vector<int> _C_perTileNnz(_C_nnz + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
 
     dim3 threads_aC {128};
-    dim3 blocks_aC {(_C_nnz-1+threads_aC.x)/threads_aC.x};
+    dim3 blocks_aC {(_C_nnz+15)/16};
 
     cudaEventRecord(aC_start, STREAM_C);
     allocate_C<<<blocks_aC, threads_aC, 0, STREAM_C>>>
