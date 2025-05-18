@@ -26,6 +26,7 @@ struct __align__(16) TileCSR_C_rev {
 
     ValueType       *vals;              // 8
     IdxType         *rowColIdx;         // 8
-    MaskType        mask[tileSize/2];   // 32
-    IdxType         rowPtr[tileSize];   // 16
+    MaskType        *mask;
+    // MaskType        mask[tileSize/2];   // 32
+    // IdxType         rowPtr[tileSize];   // 16
 };

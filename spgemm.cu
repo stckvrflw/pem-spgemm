@@ -620,7 +620,6 @@ allocate_C_noshmem
     cr_Ptr<int> d_pairs_b,
     int d_pairs_size,
 
-    r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
     int Ctiles_size,
     r_Ptr<int> _C_perTileNnz,
     cr_Ptr<int> C_targetTiles,
@@ -629,7 +628,8 @@ allocate_C_noshmem
     cr_Ptr<TileCSR_rev<ValueType,tileSize>> Btiles,
     cr_Ptr<uint16_t> Btiles_transposed_mask,
 
-    cr_Ptr<int> pairs_insertion_offset
+    cr_Ptr<int> pairs_insertion_offset,
+    r_Ptr<unsigned> Ctiles_mask
 )
 {
     auto grid = cg::this_grid();
@@ -638,7 +638,6 @@ allocate_C_noshmem
     
     auto isZero = [](unsigned n) __attribute__((always_inline)) { return ((n | (~n + 1)) >> 31) & 1; };
     auto wt_u32 = []<typename T>(uint64_t global, T val) __attribute__((always_inline)) { asm volatile("st.global.L1::no_allocate.u32 [%0], %1;" : : "l"(global) , "r"(val)); };
-
 
     int quarter_mgr = threadIdx.x >> 3;
     int quarter_tr = threadIdx.x % 8;
@@ -664,7 +663,7 @@ allocate_C_noshmem
             quarter_tr_Ctiles_mask |= C_mask;
         }
 
-        wt_u32((uint64_t)&Ctiles[quarter_group_C_idx].mask[quarter_tr], quarter_tr_Ctiles_mask);
+        wt_u32((uint64_t)&Ctiles_mask[(quarter_group_C_idx<<3)+quarter_tr], quarter_tr_Ctiles_mask);
 
         int tileC_nnz = cg::reduce(quarter_group, __popc(quarter_tr_Ctiles_mask), cg::plus<int>());
         cg::invoke_one(quarter_group, wt_u32, (uint64_t)(_C_perTileNnz + quarter_group_C_idx), tileC_nnz);
@@ -815,12 +814,12 @@ template<typename ValueType, int tileSize = 16>
 __global__ void __launch_bounds__(4 * 32) 
 C_setOffsets
 (
-    r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
     int Ctiles_size,
     r_Ptr<int> _C_perTileNnz,
     
     r_Ptr<ValueType> Ctiles_vals,
-    r_Ptr<uint8_t> Ctiles_rowColIdx
+    r_Ptr<uint8_t> Ctiles_rowColIdx,
+    cr_Ptr<unsigned> Ctiles_mask
 )
 {
     auto grid = cg::this_grid();
@@ -834,25 +833,19 @@ C_setOffsets
     int local_group_Ctiles_idx_start = (grid.block_rank() << 3) + (warp.meta_group_rank() << 1) + lgmgr;
     while(local_group_Ctiles_idx_start < Ctiles_size) 
     {
-        unsigned my_Cmask = Ctiles[local_group_Ctiles_idx_start].mask[lgtr / 2];
+        unsigned my_Cmask = Ctiles_mask[(local_group_Ctiles_idx_start<<3) + (lgtr>>1)];
         my_Cmask >>= (16 * ((lgtr % 2) ^ 0x1));
         my_Cmask &= 0xFFFF;
-        cg::invoke_one(local_group, [&]{
-            int Ctile_offset = _C_perTileNnz[local_group_Ctiles_idx_start];
-            Ctiles[local_group_Ctiles_idx_start].rowColIdx = Ctiles_rowColIdx + Ctile_offset;
-            Ctiles[local_group_Ctiles_idx_start].vals = Ctiles_vals + Ctile_offset;
-        });
+        int Ctile_offset = _C_perTileNnz[local_group_Ctiles_idx_start];
+
 
         int my_offset = cg::exclusive_scan(local_group, __popc(my_Cmask));
 
-        if(__popc(my_Cmask) > 0) 
+        for(int n = 1; n <= __popc(my_Cmask); ++n)
         {
-            for(int n = 1; n <= __popc(my_Cmask); ++n)
-            {
-                unsigned c = __fns(my_Cmask, 0, n);
-                unsigned my_rowColIdx = (lgtr << 4) | c;
-                Ctiles[local_group_Ctiles_idx_start].rowColIdx[my_offset++] = my_rowColIdx;
-            }
+            unsigned c = __fns(my_Cmask, 0, n);
+            unsigned my_rowColIdx = (lgtr << 4) | c;
+            Ctiles_rowColIdx[Ctile_offset + (my_offset++)] = my_rowColIdx;
         }
 
         local_group_Ctiles_idx_start += (grid.num_blocks() << 3);
@@ -945,10 +938,11 @@ multiply_pairs_default
     cr_Ptr<int> d_pairs_a,
     cr_Ptr<int> d_pairs_b,
     
-    r_Ptr<TileCSR_C_rev<ValueType, tileSize>> Ctiles,
     int Ctiles_size,
+    r_Ptr<ValueType> Ctiles_vals,
     r_Ptr<int> _C_perTileNnz,
     cr_Ptr<int> C_targetTiles,
+    cr_Ptr<uint8_t> Ctiles_rowColIdx,
 
     cr_Ptr<TileCSR_rev<ValueType,tileSize>> Atiles,
     cr_Ptr<TileCSR_rev<ValueType,tileSize>> Btiles,
@@ -970,13 +964,13 @@ multiply_pairs_default
     int warp_tileC_idx = (blockIdx.x << 2) + warp_mgr;
     while(warp_tileC_idx < Ctiles_size)
     {
-        TileCSR_C_rev<ValueType> * volatile tileC = Ctiles + warp_tileC_idx;
-        int volatile tileC_nnz = _C_perTileNnz[warp_tileC_idx + 1] - _C_perTileNnz[warp_tileC_idx];
+        int volatile tileC_offset = _C_perTileNnz[warp_tileC_idx];
+        int volatile tileC_nnz = _C_perTileNnz[warp_tileC_idx + 1] - tileC_offset;
         int volatile d_pairs_count = C_targetTiles_offset[warp_tileC_idx+1] - C_targetTiles_offset[warp_tileC_idx];
 
         for(int i = warp_tr; i < tileC_nnz; i += 32)
         {
-            warp_tileC_rowColIdx[warp_mgr][i] = tileC->rowColIdx[i];
+            warp_tileC_rowColIdx[warp_mgr][i] = Ctiles_rowColIdx[tileC_offset + i];
         }
 
         for(int pair = C_targetTiles_offset[warp_tileC_idx]; pair < C_targetTiles_offset[warp_tileC_idx] + d_pairs_count; ++pair) 
@@ -1000,7 +994,7 @@ multiply_pairs_default
 
                     my_mask &= (~(1 << (ffs)));
                 }
-                tileC->vals[n] += sum;
+                Ctiles_vals[tileC_offset + n] += sum;
             }
         }
         warp_tileC_idx += (gridDim.x << 2);
@@ -1128,8 +1122,9 @@ sanitize_C
 (
     r_Ptr<int> rows, 
     r_Ptr<int> cols, 
-    r_Ptr<ValueType> vals, 
-    cr_Ptr<TileCSR_C_rev<ValueType>> Ctiles,
+    r_Ptr<ValueType> vals,
+    cr_Ptr<uint8_t> Ctiles_rowColIdx,
+    cr_Ptr<ValueType> Ctiles_vals,
     int Ctiles_size,
     cr_Ptr<int> _C_tileRowIdx,
     cr_Ptr<int> _C_tileColIdx, 
@@ -1147,8 +1142,8 @@ sanitize_C
         for(int n = warp.thread_rank(); n < _C_perTile_Nnz[warp_Ctiles_id+1]-_C_perTile_Nnz[warp_Ctiles_id]; n+=warp.num_threads())
         {
             int idx = warp_Ctile_offset + n;
-            uint8_t t_rowColIdx = Ctiles[warp_Ctiles_id].rowColIdx[n];
-            ValueType t_val = Ctiles[warp_Ctiles_id].vals[n];
+            uint8_t t_rowColIdx = Ctiles_rowColIdx[warp_Ctile_offset + n];
+            ValueType t_val = Ctiles_vals[warp_Ctile_offset + n];
             rows[idx] = (warp_Ctile_y<<4) + (t_rowColIdx>>4);
             cols[idx] = (warp_Ctile_x<<4) + (t_rowColIdx&0xF);
             vals[idx] = t_val;
@@ -1597,8 +1592,8 @@ int main(int argc, char *argv[]) {
     );
     cudaEventRecord(sp1_end, STREAM_C);
 
-    TileCSR_C_rev<ValueType> *Ctiles;
-    cudaMallocAsync(&Ctiles, sizeof(TileCSR_C_rev<ValueType>) * _C_nnz, STREAM_C);
+    unsigned *Ctiles_mask;
+    cudaMallocAsync(&Ctiles_mask, sizeof(unsigned) * 8 * _C_nnz, STREAM_C);
     rmm::device_vector<int> _C_perTileNnz(_C_nnz + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
 
     dim3 threads_aC {128};
@@ -1610,14 +1605,14 @@ int main(int argc, char *argv[]) {
         d_pairs_a,
         d_pairs_b,
         pairs_insertion_offset.back(),
-        Ctiles,
         _C_nnz,
         _C_perTileNnz.data().get(),
         C_targetTile,
         Atiles.data().get(),
         Btiles.data().get(),
         Btiles_transposed_mask.data().get(),
-        pairs_insertion_offset.data().get()
+        pairs_insertion_offset.data().get(),
+        Ctiles_mask
     );
 
     thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_C), _C_perTileNnz.begin(), _C_perTileNnz.end(), _C_perTileNnz.begin());
@@ -1629,16 +1624,16 @@ int main(int argc, char *argv[]) {
     cudaMallocAsync(&Ctiles_rowColIdx, sizeof(uint8_t) * _C_perTileNnz.back(), STREAM_C);
 
     dim3 threads_Cs{128};
-    dim3 blocks_Cs{(_C_nnz-1+threads_Cs.x)/threads_Cs.x};
+    dim3 blocks_Cs{(_C_nnz+7)/8};
 
     cudaEventRecord(setOffset_start, STREAM_C);
     C_setOffsets<<<blocks_Cs, threads_Cs, 0, STREAM_C>>>
     (
-        Ctiles,
         _C_nnz,
         _C_perTileNnz.data().get(),
         Ctiles_vals,
-        Ctiles_rowColIdx
+        Ctiles_rowColIdx,
+        Ctiles_mask
     );
     cudaEventRecord(allocate_c_end, STREAM_C);
 
@@ -1652,10 +1647,11 @@ int main(int argc, char *argv[]) {
     (
         d_pairs_a,
         d_pairs_b,
-        Ctiles,
         _C_nnz,
+        Ctiles_vals,
         _C_perTileNnz.data().get(),
         C_targetTile,
+        Ctiles_rowColIdx,
         Atiles.data().get(),
         Btiles.data().get(),
         Btiles_transposed_mask.data().get(),
@@ -1718,7 +1714,8 @@ int main(int argc, char *argv[]) {
         Crows.data().get(), 
         Ccols.data().get(), 
         Cvals.data().get(), 
-        Ctiles, 
+        Ctiles_rowColIdx,
+        Ctiles_vals,
         _C_nnz,
         _C_tileRowIdx,
         _C_tileColIdx, 
