@@ -93,12 +93,9 @@ decide_which_tile
     if(my_tid >= nnz) return;
     int my_y = d_I[my_tid];
     int my_x = d_J[my_tid];
-    // int this_tile_y = my_y / tileSize;
-    // int this_tile_x = my_x / tileSize;
     int this_tile_y = my_y >> 4;
     int this_tile_x = my_x >> 4;
 
-    // long long my_tile = (static_cast<long long>(this_tile_y) << 32) | this_tile_x;
     long long my_tile = this_tile_y;
     my_tile <<= 32;
     my_tile |= this_tile_x;
@@ -148,7 +145,6 @@ generate_tiles_csr
         auto my_row_group = cg::tiled_partition<16>(block); // swap 16 to tileSize
         
         int my_row_group_rowPtr_offset = block_tile_offset_y + my_row_group.meta_group_rank();
-        // if(my_row_group_rowPtr_offset >= d_rowPtr_size) return;
         if(my_row_group_rowPtr_offset < d_rowPtr_size)
         {
             int my_row_group_rowPtr = d_rowPtr[my_row_group_rowPtr_offset];
@@ -168,10 +164,6 @@ generate_tiles_csr
         MaskType my_row_mask = thread_J != -1 ? 1 : 0;
 
         my_row_mask <<= (thread_J%tileSize);
-        // my_row_mask |=  my_row_group.shfl_down(my_row_mask, 8);
-        // my_row_mask |=  my_row_group.shfl_down(my_row_mask, 4);
-        // my_row_mask |=  my_row_group.shfl_down(my_row_mask, 2);
-        // my_row_mask |=  my_row_group.shfl_down(my_row_mask, 1);
         my_row_mask = cg::reduce(my_row_group, my_row_mask, cg::bit_or<decltype(my_row_mask)>());
 
         if(my_row_group.thread_rank() == 0) {
@@ -325,6 +317,8 @@ int cusparse_highLevelMultiply
                                       spgemmDesc, &bufferSize1, dBuffer1) )
 
     // ask bufferSize2 bytes for external memory
+    pem_spgemm_start = std::chrono::high_resolution_clock::now();
+    cudaEventRecord(start, stream);
     CHECK_CUSPARSE(
         cusparseSpGEMM_compute(handle, opA, opB,
                                &alpha, matA, matB, &beta, matC,
@@ -332,8 +326,6 @@ int cusparse_highLevelMultiply
                                spgemmDesc, &bufferSize2, NULL) )
     CHECK_CUDA( cudaMallocAsync((void**) &dBuffer2, bufferSize2, stream) )
     
-    pem_spgemm_start = std::chrono::high_resolution_clock::now();
-    cudaEventRecord(start, stream);
     // compute the intermediate product of A * B
     CHECK_CUSPARSE( cusparseSpGEMM_compute(handle, opA, opB,
                                            &alpha, matA, matB, &beta, matC,
@@ -393,7 +385,6 @@ int __find_pairs
     auto warp,
     r_Ptr<int> pairs_a,
     r_Ptr<int> pairs_b,
-    r_Ptr<int> C_targetTile,
     int w_start,
     cr_Ptr<int> lane_iter,
     int lane_iter_len,
@@ -427,7 +418,6 @@ int __find_pairs
             int targ_idx = insertion_start + lucky_ones.thread_rank();
             pairs_a[targ_idx] = first;
             pairs_b[targ_idx] = second;
-            C_targetTile[targ_idx] = w_start;
             insertion_start+=lucky_ones.num_threads();
             }
             else // 0 = first pass, only count how many are there
@@ -447,7 +437,6 @@ search_pairs
 (
     r_Ptr<int> pairs_a,
     r_Ptr<int> pairs_b,
-    r_Ptr<int> C_targetTile,
     cr_Ptr<int> C_colIdx,
     cr_Ptr<int> A_rowPtr,
     cr_Ptr<int> A_colIdx,
@@ -475,31 +464,23 @@ search_pairs
         {
         int curr_count = 0;
         if(AorB)
-        curr_count = __find_pairs<0>(warp, nullptr, nullptr, C_targetTile, w_start, A_colIdx_segment, A_colIdx_segment_len, B_rowIdx_segment, B_rowIdx_segment_len, A_rowPtr[w_C_row], B_colPtr[w_C_col], AorB, B_tileOffsets, 0);
+        curr_count = __find_pairs<0>(warp, nullptr, nullptr, w_start, A_colIdx_segment, A_colIdx_segment_len, B_rowIdx_segment, B_rowIdx_segment_len, A_rowPtr[w_C_row], B_colPtr[w_C_col], AorB, B_tileOffsets, 0);
         else
-        curr_count = __find_pairs<0>(warp, nullptr, nullptr, C_targetTile, w_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[w_C_col], A_rowPtr[w_C_row], AorB, B_tileOffsets, 0);
+        curr_count = __find_pairs<0>(warp, nullptr, nullptr, w_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[w_C_col], A_rowPtr[w_C_row], AorB, B_tileOffsets, 0);
         
         cg::reduce_store_async(warp, &pairs_insertion_offset[w_start], curr_count, cg::plus<int>());
         }
         else 
         {
         if(AorB)
-        __find_pairs<1>(warp ,pairs_a, pairs_b, C_targetTile, w_start, A_colIdx_segment, A_colIdx_segment_len, B_rowIdx_segment, B_rowIdx_segment_len, A_rowPtr[w_C_row], B_colPtr[w_C_col], AorB, B_tileOffsets, pairs_insertion_offset[w_start]);
+        __find_pairs<1>(warp ,pairs_a, pairs_b, w_start, A_colIdx_segment, A_colIdx_segment_len, B_rowIdx_segment, B_rowIdx_segment_len, A_rowPtr[w_C_row], B_colPtr[w_C_col], AorB, B_tileOffsets, pairs_insertion_offset[w_start]);
         else
-        __find_pairs<1>(warp, pairs_a, pairs_b, C_targetTile, w_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[w_C_col], A_rowPtr[w_C_row], AorB, B_tileOffsets, pairs_insertion_offset[w_start]);
+        __find_pairs<1>(warp, pairs_a, pairs_b, w_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[w_C_col], A_rowPtr[w_C_row], AorB, B_tileOffsets, pairs_insertion_offset[w_start]);
         }
         
         w_start += (gridDim.x << 3);
     }
 }
-
-enum TAGS {
-    // ONE,
-    // SIXTEEN,
-    NONDENSE,
-    DENSE,
-    TAGS_COUNT
-};
 
 template<typename ValueType, int tileSize = 16>
 __global__ void __launch_bounds__(4 * 32) 
@@ -511,7 +492,6 @@ allocate_C_noshmem
 
     int Ctiles_size,
     r_Ptr<int> _C_perTileNnz,
-    cr_Ptr<int> C_targetTiles,
 
     cr_Ptr<TileCSR_rev<ValueType,tileSize>> Atiles,
     cr_Ptr<TileCSR_rev<ValueType,tileSize>> Btiles,
@@ -526,7 +506,7 @@ allocate_C_noshmem
     auto warp = cg::tiled_partition<32>(block);
     
     auto isZero = [](unsigned n) __attribute__((always_inline)) { return ((n | (~n + 1)) >> 31) & 1; };
-    auto wt_u32 = []<typename T>(uint64_t global, T val) __attribute__((always_inline)) { asm volatile("st.global.L1::evict_first.u32 [%0], %1;" : : "l"(global) , "r"(val)); };
+    auto wt_u32 = []<typename T>(uint64_t global, T val) __attribute__((always_inline)) { asm volatile("st.global.cs.u32 [%0], %1;" : : "l"(global) , "r"(val)); };
 
     int quarter_mgr = threadIdx.x >> 3;
     int quarter_tr = threadIdx.x % 8;
@@ -587,8 +567,7 @@ C_setOffsets
         unsigned my_Cmask = Ctiles_mask[(local_group_Ctiles_idx_start<<3) + (lgtr>>1)];
         my_Cmask >>= (16 * ((lgtr % 2) ^ 0x1));
         my_Cmask &= 0xFFFF;
-            int Ctile_offset = _C_perTileNnz[local_group_Ctiles_idx_start];
-
+        int Ctile_offset = _C_perTileNnz[local_group_Ctiles_idx_start];
 
         int my_offset = cg::exclusive_scan(local_group, __popc(my_Cmask));
 
@@ -614,14 +593,13 @@ multiply_pairs_default
     int Ctiles_size,
     r_Ptr<ValueType> Ctiles_vals,
     r_Ptr<int> _C_perTileNnz,
-    cr_Ptr<int> C_targetTiles,
     cr_Ptr<uint8_t> Ctiles_rowColIdx,
 
     cr_Ptr<TileCSR_rev<ValueType,tileSize>> Atiles,
     cr_Ptr<TileCSR_rev<ValueType,tileSize>> Btiles,
 
     cr_Ptr<uint16_t> Btiles_transposed_mask,
-    cr_Ptr<int> C_targetTiles_offset
+    cr_Ptr<int> pairs_insertion_offset
 )
 {
     using IdxType = uint8_t;
@@ -639,14 +617,14 @@ multiply_pairs_default
     {
         int volatile tileC_offset = _C_perTileNnz[warp_tileC_idx];
         int volatile tileC_nnz = _C_perTileNnz[warp_tileC_idx + 1] - tileC_offset;
-        int volatile d_pairs_count = C_targetTiles_offset[warp_tileC_idx+1] - C_targetTiles_offset[warp_tileC_idx];
+        int volatile d_pairs_count = pairs_insertion_offset[warp_tileC_idx+1] - pairs_insertion_offset[warp_tileC_idx];
 
         for(int i = warp_tr; i < tileC_nnz; i += 32)
         {
             warp_tileC_rowColIdx[warp_mgr][i] = Ctiles_rowColIdx[tileC_offset + i];
         }
 
-        for(int pair = C_targetTiles_offset[warp_tileC_idx]; pair < C_targetTiles_offset[warp_tileC_idx] + d_pairs_count; ++pair) 
+        for(int pair = pairs_insertion_offset[warp_tileC_idx]; pair < pairs_insertion_offset[warp_tileC_idx] + d_pairs_count; ++pair) 
         {
             int A = d_pairs_a[pair];
             int B = d_pairs_b[pair];
@@ -654,7 +632,7 @@ multiply_pairs_default
             // calculate C
             for(int n = warp_tr; n < tileC_nnz; n+=32)
             {
-                ValueType sum = 0;
+                // ValueType sum = 0;
                 int r = warp_tileC_rowColIdx[warp_mgr][n] >> 4;
                 int c = warp_tileC_rowColIdx[warp_mgr][n] & 0xF;
                 unsigned my_mask = Atiles[A].mask[r] & Btiles_transposed_mask[(B<<4)+c];
@@ -663,11 +641,11 @@ multiply_pairs_default
                     int ffs = __ffs(my_mask)-1;
                     int A_offset = __popc( Atiles[A].mask[r] & (0xFFFFU >> (16-ffs)) );
                     int B_offset = __popc( Btiles[B].mask[ffs] & (0xFFFFU >> (16-c)) );
-                    sum += Atiles[A].vals[Atiles[A].rowPtr[r]+A_offset] * Btiles[B].vals[Btiles[B].rowPtr[ffs]+B_offset];
+                    Ctiles_vals[tileC_offset + n] += Atiles[A].vals[Atiles[A].rowPtr[r]+A_offset] * Btiles[B].vals[Btiles[B].rowPtr[ffs]+B_offset];
 
                     my_mask &= (~(1 << (ffs)));
                 }
-                Ctiles_vals[tileC_offset + n] += sum;
+                // Ctiles_vals[tileC_offset + n] += sum;
             }
         }
         warp_tileC_idx += (gridDim.x << 2);
@@ -680,7 +658,6 @@ sanitize_C
 (
     r_Ptr<int> rows, 
     r_Ptr<int> cols, 
-    // r_Ptr<ValueType> vals,
     cr_Ptr<uint8_t> Ctiles_rowColIdx,
     cr_Ptr<ValueType> Ctiles_vals,
     int Ctiles_size,
@@ -701,10 +678,8 @@ sanitize_C
         {
             int idx = warp_Ctile_offset + n;
             uint8_t t_rowColIdx = Ctiles_rowColIdx[warp_Ctile_offset + n];
-            // ValueType t_val = Ctiles_vals[warp_Ctile_offset + n];
             rows[idx] = (warp_Ctile_y<<4) + (t_rowColIdx>>4);
             cols[idx] = (warp_Ctile_x<<4) + (t_rowColIdx&0xF);
-            // vals[idx] = t_val;
         }
 
         warp_Ctiles_id += (gridDim.x << 3);
@@ -1079,7 +1054,6 @@ int main(int argc, char *argv[]) {
     int *_C_tileColIdx, *_C_tileRowIdx;
 
     std::chrono::high_resolution_clock::time_point pem_spgemm_start;
-    // cudaEventRecord(high_level_multiply_start, STREAM_C);
     int _C_nnz = cusparse_highLevelMultiply
     (
         _A_tileRowPtr.data().get(),
@@ -1103,7 +1077,6 @@ int main(int argc, char *argv[]) {
         high_level_multiply_end,
         pem_spgemm_start
     );
-    // cudaEventRecord(high_level_multiply_end, STREAM_C);
     
     std::cout << "\nCOUNTING PAIRS\n";
     dim3 threads_sp{256};
@@ -1114,7 +1087,6 @@ int main(int argc, char *argv[]) {
     cudaEventRecord(allocate_c_start, STREAM_C);
     search_pairs<0><<<blocks_sp, threads_sp, 0, STREAM_C>>>
     (
-        nullptr,
         nullptr,
         nullptr,
         _C_tileColIdx,
@@ -1131,18 +1103,15 @@ int main(int argc, char *argv[]) {
     thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_C), pairs_insertion_offset.begin(), pairs_insertion_offset.end(), pairs_insertion_offset.begin());
     cudaEventRecord(sp0_end, STREAM_C);
 
-    int *d_pairs_a, *d_pairs_b, *C_targetTile;
+    int *d_pairs_a, *d_pairs_b;
     cudaMallocAsync(&d_pairs_a, sizeof(int) * pairs_insertion_offset.back(), STREAM_C); 
     cudaMallocAsync(&d_pairs_b, sizeof(int) * pairs_insertion_offset.back(), STREAM_C); 
-    cudaMallocAsync(&C_targetTile, sizeof(int) * pairs_insertion_offset.back(), STREAM_C); 
-
 
     cudaEventRecord(sp1_start, STREAM_C);
     search_pairs<1><<<blocks_sp, threads_sp, 0, STREAM_C>>>
     (
         d_pairs_a,
         d_pairs_b,
-        C_targetTile,
         _C_tileColIdx,
         _A_tileRowPtr.data().get(),
         _A_tileColIdx.data().get(),
@@ -1171,7 +1140,6 @@ int main(int argc, char *argv[]) {
         pairs_insertion_offset.back(),
         _C_nnz,
         _C_perTileNnz.data().get(),
-        C_targetTile,
         Atiles.data().get(),
         Btiles.data().get(),
         Btiles_transposed_mask.data().get(),
@@ -1214,7 +1182,6 @@ int main(int argc, char *argv[]) {
         _C_nnz,
         Ctiles_vals,
         _C_perTileNnz.data().get(),
-        C_targetTile,
         Ctiles_rowColIdx,
         Atiles.data().get(),
         Btiles.data().get(),
@@ -1257,7 +1224,7 @@ int main(int argc, char *argv[]) {
     std::cout << "Allocating C took--------------------" << allocate_c_time << "ms\n";
     std::cout << "Accumulator took---------------------" << accumulator_time << "ms\n\n";
     
-    std::cout << "PEM-SPGEMM took " << std::fixed << std::setprecision(2) 
+    std::cout << "pemSpGEMM took " << std::fixed << std::setprecision(2) 
     << pem_spgemm_time << "ms\nKernel time " << kernel_time << "ms\nmalloc time " << malloc_time << "ms\n";
     std::cout << "C tiles: " << _C_nnz << "\n";
     std::cout << "C nnz: " << _C_perTileNnz.back() << "\n";
@@ -1272,11 +1239,9 @@ int main(int argc, char *argv[]) {
     rmm::device_vector<int>(SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C)).swap(pairs_insertion_offset);
     cudaFreeAsync(d_pairs_a, STREAM_C);
     cudaFreeAsync(d_pairs_b, STREAM_C);
-    cudaFreeAsync(C_targetTile, STREAM_C);
 
     rmm::device_vector<int> Crows(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
     rmm::device_vector<int> Ccols(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
-    // rmm::device_vector<ValueType> Cvals(_C_perTileNnz.back(), SPGEMM_STREAM_ALLOCATOR_VALUETYPE(STREAM_C));
 
     dim3 threads_sC {tileSize * tileSize};
     dim3 blocks_sC {(_C_nnz+7)/8};
@@ -1290,7 +1255,6 @@ int main(int argc, char *argv[]) {
     (
         Crows.data().get(), 
         Ccols.data().get(), 
-        // Cvals.data().get(), 
         Ctiles_rowColIdx,
         Ctiles_vals,
         _C_nnz,
@@ -1329,7 +1293,6 @@ int main(int argc, char *argv[]) {
     thrust::copy(Crows.begin(), Crows.end(), hCrows.begin());
     thrust::copy(Ccols.begin(), Ccols.end(), hCcols.begin());
     cudaMemcpy(hCvals.data(), Ctiles_vals, sizeof(ValueType) * _C_perTileNnz.back(), cudaMemcpyDeviceToHost);
-
 
     outfile.open(filename0, std::ios::out);
     outfile << _C_perTileNnz.back();
