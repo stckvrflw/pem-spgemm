@@ -15,9 +15,6 @@ Author: Petrus E. Manurung
 #include <cooperative_groups/reduce.h>
 #include <cooperative_groups/memcpy_async.h>
 
-#include <cuda/pipeline>
-#include <mma.h>
-
 #include <thrust/sort.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/iterator/constant_iterator.h>
@@ -40,6 +37,7 @@ Author: Petrus E. Manurung
 #include "fast_matrix_market/fast_matrix_market.hpp"
 #include "TileCSR.h"
 #include "utilities.h"
+#include "spgemm_nsparse_kernel.h"
 
 namespace cg = cooperative_groups;
 
@@ -234,147 +232,127 @@ __transpose_B_mask
     }
 }
 
-__attribute__((optimize("O3")))
-int cusparse_highLevelMultiply
-(
-    r_Ptr<int> dA_csrOffsets,
-    r_Ptr<int> dA_columns,
-    r_Ptr<half> dA_values,
-    int A_num_rows,
-    int A_num_cols,
-    int A_nnz,
-    r_Ptr<int> dB_csrOffsets,
-    r_Ptr<int> dB_columns,
-    r_Ptr<half> dB_values,
-    int B_num_rows,
-    int B_num_cols,
-    int B_nnz,
-    int **d_CtileRowIdx,
-    int **d_CtileColIdx,
-    cudaStream_t stream,
-    rmm::exec_policy_nosync ASYNC_EXEC_POLICY,
-    cudaEvent_t &cusparse_start,
-    cudaEvent_t &cusparse_end,
-    cudaEvent_t &start,
-    cudaEvent_t &end,
-    std::chrono::high_resolution_clock::time_point &pem_spgemm_start
-)
+__forceinline__ __device__ int sum_32_shfl(int sum)
 {
-    int *dC_csrOffsets;
-    int *dC_columns;
-    int *dC_rows;
-    half *dC_values;
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1)
+        sum += __shfl_xor_sync(0xffffffff, sum, mask);
 
-    cusparseHandle_t     handle = NULL;
-    cusparseSpMatDescr_t matA, matB, matC;
+    return sum;
+}
 
-    cusparseOperation_t opA         = CUSPARSE_OPERATION_NON_TRANSPOSE;
-    cusparseOperation_t opB         = CUSPARSE_OPERATION_NON_TRANSPOSE;
-    cudaDataType        computeType = CUDA_R_16F;
-    half               alpha       = 1.0;
-    half               beta        = 0.0;
+__global__ void tile_spgemm_step1_cuda_spa_kernel(int *d_blkrowptrA, int *d_blkcolidxA, int blkmA,
+                                                  int *d_blkrowptrB, int *d_blkcolidxB, int blknB,
+                                                  int *d_blkrowptrC)
+{
+    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+    const int global_warp_id = global_id >> 5; //global_id / WARP_SIZE;
+    __shared__ unsigned int bitmask[WARP_PER_BLOCK * SPA_INT_PER_WARP];
 
-    void*  dBuffer1    = NULL, *dBuffer2   = NULL;
-    size_t bufferSize1 = 0,    bufferSize2 = 0;
+    if (global_warp_id >= blkmA)
+        return;
 
-    CHECK_CUSPARSE( cusparseCreate(&handle) )
-    CHECK_CUSPARSE( cusparseSetStream(handle, stream) )
-    cudaEventRecord(cusparse_start, stream);
-    CHECK_CUSPARSE( cusparseCreateCsr(&matA, A_num_rows, A_num_cols, A_nnz,
-                                      dA_csrOffsets, dA_columns, dA_values,
-                                      CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
-                                      CUSPARSE_INDEX_BASE_ZERO, CUDA_R_16F) )
-    CHECK_CUSPARSE( cusparseCreateCsr(&matB, B_num_rows, B_num_cols, B_nnz,
-                                      dB_csrOffsets, dB_columns, dB_values,
-                                      CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
-                                      CUSPARSE_INDEX_BASE_ZERO, CUDA_R_16F) )
-    CHECK_CUSPARSE( cusparseCreateCsr(&matC, A_num_rows, B_num_cols, 0,
-                                      dC_csrOffsets, NULL, NULL,
-                                      CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
-                                      CUSPARSE_INDEX_BASE_ZERO, CUDA_R_16F) )
+    const int nmasks = ceil((float)blknB / (float)32);
+    const int local_warp_id = threadIdx.x >> 5; //global_id / WARP_SIZE;
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    unsigned int *bitmask_local = &bitmask[local_warp_id * SPA_INT_PER_WARP];
 
-    // allocate C offsets
-    CHECK_CUDA( cudaMallocAsync((void**) &dC_csrOffsets,
-                           (A_num_rows + 1) * sizeof(int), stream) )
+    for (int i = lane_id; i < nmasks; i += WARP_SIZE)
+        bitmask_local[i] = 0;
 
-    // SpGEMM Computation
-    cusparseSpGEMMDescr_t spgemmDesc;
-    CHECK_CUSPARSE( cusparseSpGEMM_createDescr(&spgemmDesc) )
-    
-    // ask bufferSize1 bytes for external memory
-    CHECK_CUSPARSE(
-        cusparseSpGEMM_workEstimation(handle, opA, opB,
-                                      &alpha, matA, matB, &beta, matC,
-                                      computeType, CUSPARSE_SPGEMM_DEFAULT,
-                                      spgemmDesc, &bufferSize1, NULL) )
-    CHECK_CUDA( cudaMallocAsync((void**) &dBuffer1, bufferSize1, stream) )
-    // inspect the matrices A and B to understand the memory requirement for
-    // the next step
-    CHECK_CUSPARSE(
-        cusparseSpGEMM_workEstimation(handle, opA, opB,
-                                      &alpha, matA, matB, &beta, matC,
-                                      computeType, CUSPARSE_SPGEMM_DEFAULT,
-                                      spgemmDesc, &bufferSize1, dBuffer1) )
+    int astart = d_blkrowptrA[global_warp_id];
+    int astop = d_blkrowptrA[global_warp_id + 1];
+    for (int i = astart; i < astop; i++)
+    {
+        int rowidx = d_blkcolidxA[i];
+        int bstart = d_blkrowptrB[rowidx];
+        int bstop = d_blkrowptrB[rowidx + 1];
+        for (int j = bstart + lane_id; j < bstop; j += WARP_SIZE)
+        {
+            int colidx = d_blkcolidxB[j];
+            unsigned int mask = 1 << (31 - colidx % 32);
+            atomicOr(&bitmask_local[colidx / 32], mask);
+        }
+    }
+    //__syncthreads();
 
-    // ask bufferSize2 bytes for external memory
-    pem_spgemm_start = std::chrono::high_resolution_clock::now();
-    cudaEventRecord(start, stream);
-    CHECK_CUSPARSE(
-        cusparseSpGEMM_compute(handle, opA, opB,
-                               &alpha, matA, matB, &beta, matC,
-                               computeType, CUSPARSE_SPGEMM_DEFAULT,
-                               spgemmDesc, &bufferSize2, NULL) )
-    CHECK_CUDA( cudaMallocAsync((void**) &dBuffer2, bufferSize2, stream) )
-    
-    // compute the intermediate product of A * B
-    CHECK_CUSPARSE( cusparseSpGEMM_compute(handle, opA, opB,
-                                           &alpha, matA, matB, &beta, matC,
-                                           computeType, CUSPARSE_SPGEMM_DEFAULT,
-                                           spgemmDesc, &bufferSize2, dBuffer2) )
-    // get matrix C non-zero entries C_nnz1
-    int64_t C_num_rows1, C_num_cols1, C_nnz1;
-    CHECK_CUSPARSE( cusparseSpMatGetSize(matC, &C_num_rows1, &C_num_cols1,
-                                         &C_nnz1) )
-    // allocate matrix C
-    CHECK_CUDA( cudaMallocAsync((void**) &dC_columns, C_nnz1 * sizeof(int), stream)   )
-    CHECK_CUDA( cudaMallocAsync((void**) &dC_values,  C_nnz1 * sizeof(half), stream) )
-    CHECK_CUDA( cudaMallocAsync((void**) &dC_rows, C_nnz1 * sizeof(int), stream) )
+    int cnt = 0;
+    for (int i = lane_id; i < nmasks; i += WARP_SIZE)
+        cnt += __popc(bitmask_local[i]);
+    cnt = sum_32_shfl(cnt);
 
-    // NOTE: if 'beta' != 0, the values of C must be update after the allocation
-    //       of dC_values, and before the call of cusparseSpGEMM_copy
+    if (!lane_id)
+        d_blkrowptrC[global_warp_id] = cnt;
+}
 
-    // update matC with the new pointers
-    CHECK_CUSPARSE(
-        cusparseCsrSetPointers(matC, dC_csrOffsets, dC_columns, dC_values) )
+__global__ void tile_spgemm_step1_numeric_cuda_spa_kernel(int *d_blkrowptrA, int *d_blkcolidxA, int blkmA,
+                                                          int *d_blkrowptrB, int *d_blkcolidxB, int blknB,
+                                                          int *d_blkrowptrC, int *d_blkrowidxC, int *d_blkcolidxC,
+                                                          int *d_spec_intersection_cnt, int *d_spec_intersection_posa, int *d_spec_intersection_posb)
+{
+    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+    const int global_warp_id = global_id >> 5; //global_id / WARP_SIZE;
+    __shared__ unsigned int bitmask[WARP_PER_BLOCK * SPA_INT_PER_WARP];
 
-    // if beta != 0, cusparseSpGEMM_copy reuses/updates the values of dC_values
+    if (global_warp_id >= blkmA)
+        return;
 
-    // copy the final products to the matrix C
-    CHECK_CUSPARSE(
-        cusparseSpGEMM_copy(handle, opA, opB,
-                            &alpha, matA, matB, &beta, matC,
-                            computeType, CUSPARSE_SPGEMM_DEFAULT, spgemmDesc) )
+    const int nmasks = ceil((float)blknB / (float)32);
+    const int nmasks_warpwise = ceil((float)nmasks / (float)WARP_SIZE) * WARP_SIZE; // make sure shfl func works
+    const int local_warp_id = threadIdx.x >> 5;                                     //global_id / WARP_SIZE;
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    unsigned int *bitmask_local = &bitmask[local_warp_id * SPA_INT_PER_WARP];
 
-    CHECK_CUSPARSE( cusparseXcsr2coo(handle, dC_csrOffsets, C_nnz1, C_num_rows1, dC_rows, CUSPARSE_INDEX_BASE_ZERO) )
-    cudaEventRecord(end, stream);
+    for (int i = lane_id; i < nmasks_warpwise; i += WARP_SIZE)
+        bitmask_local[i] = 0;
 
-    // this is not wrong, swapped because Xcsr2coo is confusing
-    *d_CtileColIdx = dC_rows;
-    *d_CtileRowIdx = dC_columns;
+    int cbase = d_blkrowptrC[global_warp_id];
 
-    // destroy matrix/vector descriptors
-    CHECK_CUSPARSE( cusparseSpGEMM_destroyDescr(spgemmDesc) )
-    CHECK_CUSPARSE( cusparseDestroySpMat(matA) )
-    CHECK_CUSPARSE( cusparseDestroySpMat(matB) )
-    CHECK_CUSPARSE( cusparseDestroySpMat(matC) )
-    CHECK_CUSPARSE( cusparseDestroy(handle) )
+    int astart = d_blkrowptrA[global_warp_id];
+    int astop = d_blkrowptrA[global_warp_id + 1];
+    for (int i = astart; i < astop; i++)
+    {
+        int rowidx = d_blkcolidxA[i];
+        int bstart = d_blkrowptrB[rowidx];
+        int bstop = d_blkrowptrB[rowidx + 1];
+        for (int j = bstart + lane_id; j < bstop; j += WARP_SIZE)
+        {
+            int colidx = d_blkcolidxB[j];
+            unsigned int mask = 1 << (31 - colidx % 32);
+            atomicOr(&bitmask_local[colidx / 32], mask);
+        }
+    }
 
-    cudaFreeAsync(dC_csrOffsets, stream);
-    cudaFreeAsync(dC_values, stream);
+    int cnt = 0;
+    int offset = 0;
+    for (int i = lane_id; i < nmasks_warpwise; i += WARP_SIZE)
+    {
+        unsigned int maski = bitmask_local[i];
+        int cnt = __popc(maski);
 
-    cudaEventRecord(cusparse_end, stream);
+        // inclusive scan
+        int cnt_scan = scan_32_shfl(cnt, lane_id);
+        cnt_scan += offset;
 
-    return C_nnz1;
+        // sum
+        offset = __shfl_sync(0xffffffff, cnt_scan, 31);
+
+        // to exclusive scan
+        cnt_scan -= cnt;
+
+        // write to gmem
+        int localoff = 0;
+#pragma unroll
+        for (int biti = 0; biti < 32; biti++)
+        {
+            if ((maski >> (31 - biti)) & 0x1)
+            {
+                d_blkrowidxC[cbase + cnt_scan + localoff] = global_warp_id;
+                d_blkcolidxC[cbase + cnt_scan + localoff] = i * 32 + biti;
+                localoff++;
+            }
+        }
+    }
 }
 
 template<int pass>
@@ -433,7 +411,7 @@ int __find_pairs
 
 template<int pass>
 __global__ void __launch_bounds__(256) 
-search_pairs
+pem_spgemm_step2_search_pairs
 (
     r_Ptr<int> pairs_a,
     r_Ptr<int> pairs_b,
@@ -449,15 +427,22 @@ search_pairs
     r_Ptr<int> pairs_insertion_offset
 )
 {
+    auto wt_s32 = []<typename T>(uintptr_t global, T &val) __attribute__((always_inline)) { asm volatile("st.global.cs.s32 [%0], %1;" : : "l"(global) , "r"(val)); };
+
     auto warp = cg::tiled_partition<32>(cg::this_thread_block());
     int w_start = (blockIdx.x << 3) + (threadIdx.x >> 5);
-    while(w_start < C_colIdx_size) {
+    while(w_start < C_colIdx_size) 
+    {
         int w_C_col = C_colIdx[w_start];
         int w_C_row = C_rowIdx[w_start];
         decltype(A_colIdx) A_colIdx_segment = A_colIdx + A_rowPtr[w_C_row];
         decltype(B_rowIdx) B_rowIdx_segment = B_rowIdx + B_colPtr[w_C_col];
         int A_colIdx_segment_len = A_rowPtr[w_C_row + 1] - A_rowPtr[w_C_row];
         int B_rowIdx_segment_len = B_colPtr[w_C_col + 1] - B_colPtr[w_C_col];
+        // if(A_colIdx_segment_len == 0 || B_rowIdx_segment_len == 0){
+        //     w_start += (gridDim.x << 3);
+        //     continue;
+        // }
         int AorB = A_colIdx_segment_len <= B_rowIdx_segment_len ? 1 : 0; // A = 1; B = 0;
 
         if constexpr(pass == 0) 
@@ -468,7 +453,8 @@ search_pairs
         else
         curr_count = __find_pairs<0>(warp, nullptr, nullptr, w_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[w_C_col], A_rowPtr[w_C_row], AorB, B_tileOffsets, 0);
         
-        cg::reduce_store_async(warp, &pairs_insertion_offset[w_start], curr_count, cg::plus<int>());
+        curr_count = cg::reduce(warp, curr_count, cg::plus<int>());
+        cg::invoke_one(warp, wt_s32, (uintptr_t)&pairs_insertion_offset[w_start], curr_count);
         }
         else 
         {
@@ -477,14 +463,14 @@ search_pairs
         else
         __find_pairs<1>(warp, pairs_a, pairs_b, w_start, B_rowIdx_segment, B_rowIdx_segment_len, A_colIdx_segment, A_colIdx_segment_len, B_colPtr[w_C_col], A_rowPtr[w_C_row], AorB, B_tileOffsets, pairs_insertion_offset[w_start]);
         }
-        
+
         w_start += (gridDim.x << 3);
     }
 }
 
 template<typename ValueType, int tileSize = 16>
 __global__ void __launch_bounds__(4 * 32) 
-allocate_C_noshmem
+pem_spgemm_step2_compute_CMasksAndOffsets
 (
     cr_Ptr<int> d_pairs_a,
     cr_Ptr<int> d_pairs_b,
@@ -543,7 +529,7 @@ allocate_C_noshmem
 
 template<typename ValueType, int tileSize = 16>
 __global__ void __launch_bounds__(4 * 32) 
-C_setOffsets
+pem_spgemm_step2_compute_CrowColIdx
 (
     int Ctiles_size,
     r_Ptr<int> _C_perTileNnz,
@@ -585,7 +571,7 @@ C_setOffsets
 template<typename ValueType, int tileSize = 16>
 __global__ void 
 __launch_bounds__(tileSize * tileSize / 2)
-multiply_pairs_default
+pem_spgemm_step3_accumulate
 (
     cr_Ptr<int> d_pairs_a,
     cr_Ptr<int> d_pairs_b,
@@ -603,6 +589,8 @@ multiply_pairs_default
 )
 {
     using IdxType = uint8_t;
+    using MaskType = uint16_t;
+
     __shared__ IdxType warp_tileC_rowColIdx [4][256];
 
     int volatile warp_tr = threadIdx.x % 32;
@@ -635,15 +623,15 @@ multiply_pairs_default
                 // ValueType sum = 0;
                 int r = warp_tileC_rowColIdx[warp_mgr][n] >> 4;
                 int c = warp_tileC_rowColIdx[warp_mgr][n] & 0xF;
-                unsigned my_mask = Atiles[A].mask[r] & Btiles_transposed_mask[(B<<4)+c];
-                while(my_mask)
+                unsigned lane_mask = Atiles[A].mask[r] & Btiles_transposed_mask[(B<<4)+c];
+                while(lane_mask)
                 {
-                    int ffs = __ffs(my_mask)-1;
+                    int ffs = __ffs(lane_mask)-1;
                     int A_offset = __popc( Atiles[A].mask[r] & (0xFFFFU >> (16-ffs)) );
                     int B_offset = __popc( Btiles[B].mask[ffs] & (0xFFFFU >> (16-c)) );
                     Ctiles_vals[tileC_offset + n] += Atiles[A].vals[Atiles[A].rowPtr[r]+A_offset] * Btiles[B].vals[Btiles[B].rowPtr[ffs]+B_offset];
 
-                    my_mask &= (~(1 << (ffs)));
+                    lane_mask &= (~(1 << (ffs)));
                 }
                 // Ctiles_vals[tileC_offset + n] += sum;
             }
@@ -755,7 +743,7 @@ int main(int argc, char *argv[]) {
     auto SPGEMM_STREAM_ALLOCATOR_UINT8 = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<uint8_t>(STREAM, SPGEMM_MR);};
     auto SPGEMM_STREAM_ALLOCATOR_UINT16 = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<uint16_t>(STREAM, SPGEMM_MR);};
     auto SPGEMM_STREAM_ALLOCATOR_HALF = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<half>(STREAM, SPGEMM_MR);};
-
+    auto SPGEMM_STREAM_ALLOCATOR_UNSIGNED = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<unsigned>(STREAM, SPGEMM_MR);};
 
     auto SPGEMM_TEMPORARY_MR = rmm::mr::cuda_async_memory_resource(sizeof(char) * OVERHEAD);
     auto ASYNC_EXEC_POLICY = [&SPGEMM_TEMPORARY_MR](auto STREAM){return rmm::exec_policy_nosync(STREAM, &SPGEMM_TEMPORARY_MR);};
@@ -1051,33 +1039,92 @@ int main(int argc, char *argv[]) {
     cudaStreamWaitEvent(STREAM_C, A_tileConversion_end);
     cudaStreamWaitEvent(STREAM_C, B_tileConversion_end);
 
-    int *_C_tileColIdx, *_C_tileRowIdx;
+    auto pem_spgemm_start = std::chrono::high_resolution_clock::now();
+    //<<<---------------------------------------------->>>
+    rmm::device_vector<int> _C_rowPtr(A_tileRows + 1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
+    int _C_nnz = 0;
+    sfBIN bin;
 
-    std::chrono::high_resolution_clock::time_point pem_spgemm_start;
-    int _C_nnz = cusparse_highLevelMultiply
-    (
-        _A_tileRowPtr.data().get(),
-        _A_tileColIdx.data().get(),
-        _A_tileVals.data().get(),
-        A_tileRows,
-        A_tileCols,
-        _A_tileVals.size(),
-        _B_tileRowPtr.data().get(),
-        _B_tileColIdx.data().get(),
-        _B_tileVals.data().get(),
-        B_tileRows,
-        B_tileCols,
-        _B_tileVals.size(),
-        &_C_tileColIdx, &_C_tileRowIdx,
-        STREAM_C,
-        ASYNC_EXEC_POLICY(STREAM_C),
-        cusparse_start,
-        cusparse_end,
-        high_level_multiply_start,
-        high_level_multiply_end,
-        pem_spgemm_start
-    );
-    
+    if(B_tileCols > 512 * 32)
+    {
+        cudaDeviceSynchronize();
+        cudaEventRecord(high_level_multiply_start);
+        printf("\nstep1 using NSPARSE\n");
+        init_bin(&bin, A_tileRows);
+        set_max_bin(_A_tileRowPtr.data().get(), _A_tileColIdx.data().get(), _B_tileRowPtr.data().get(), &bin, A_tileRows);
+        set_row_nnz(_A_tileRowPtr.data().get(), _A_tileColIdx.data().get(), _B_tileRowPtr.data().get(), _B_tileColIdx.data().get(),
+        _C_rowPtr.data().get(), &bin, A_tileRows, &_C_nnz);
+        set_min_bin(&bin, A_tileRows);
+    }
+    else
+    {
+        printf("\nstep1 using TileSpGEMM's\n");
+        int step1_numthreads = 128;
+        int step1_numblocks = ceil((double)A_tileRows / (double)4);
+        cudaEventRecord(high_level_multiply_start, STREAM_C);
+        tile_spgemm_step1_cuda_spa_kernel<<<step1_numblocks, step1_numthreads, 0, STREAM_C>>>
+        (
+            _A_tileRowPtr.data().get(),
+            _A_tileColIdx.data().get(),
+            A_tileRows,
+            _B_tileRowPtr.data().get(),
+            _B_tileColIdx.data().get(),
+            B_tileCols,
+            _C_rowPtr.data().get()
+        );
+        thrust::exclusive_scan(ASYNC_EXEC_POLICY(STREAM_C), _C_rowPtr.begin(), _C_rowPtr.end(), _C_rowPtr.begin());
+        _C_nnz = _C_rowPtr.back();
+    }
+
+    int *_C_tileRowIdx, *_C_tileColIdx;
+    cudaMallocAsync(&_C_tileColIdx, _C_nnz * sizeof(int), STREAM_C);
+    cudaMallocAsync(&_C_tileRowIdx, _C_nnz * sizeof(int), STREAM_C);
+
+    if(B_tileCols > 512 * 32)
+    {
+        cudaDeviceSynchronize();
+        calculate_value_col_bin
+        (
+            _A_tileRowPtr.data().get(),
+            _A_tileColIdx.data().get(),
+            nullptr,
+            _B_tileRowPtr.data().get(),
+            _B_tileColIdx.data().get(),
+            nullptr,
+            _C_rowPtr.data().get(),
+            _C_tileRowIdx,
+            _C_tileColIdx,
+            nullptr,
+            &bin,
+            A_tileRows,
+            B_tileCols
+        );
+        release_bin(bin);
+        cudaEventRecord(high_level_multiply_end);
+        cudaDeviceSynchronize();
+    }
+    else
+    {
+        int step1_numthreads = 128;
+        int step1_numblocks = ceil((double)A_tileRows / (double)4);
+        tile_spgemm_step1_numeric_cuda_spa_kernel<<<step1_numblocks, step1_numthreads, 0, STREAM_C>>>
+        (
+            _A_tileRowPtr.data().get(),
+            _A_tileColIdx.data().get(),
+            A_tileRows,
+            _B_tileRowPtr.data().get(),
+            _B_tileColIdx.data().get(),
+            B_tileCols,
+            _C_rowPtr.data().get(),
+            _C_tileRowIdx,
+            _C_tileColIdx,
+            nullptr,
+            nullptr,
+            nullptr
+        );
+        cudaEventRecord(high_level_multiply_end, STREAM_C);
+    }
+
     std::cout << "\nCOUNTING PAIRS\n";
     dim3 threads_sp{256};
     dim3 blocks_sp{(_C_nnz-1+threads_sp.x)/threads_sp.x};
@@ -1085,7 +1132,7 @@ int main(int argc, char *argv[]) {
     rmm::device_vector<int> pairs_insertion_offset(_C_nnz+1, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_C));
 
     cudaEventRecord(allocate_c_start, STREAM_C);
-    search_pairs<0><<<blocks_sp, threads_sp, 0, STREAM_C>>>
+    pem_spgemm_step2_search_pairs<0><<<blocks_sp, threads_sp, 0, STREAM_C>>>
     (
         nullptr,
         nullptr,
@@ -1108,7 +1155,7 @@ int main(int argc, char *argv[]) {
     cudaMallocAsync(&d_pairs_b, sizeof(int) * pairs_insertion_offset.back(), STREAM_C); 
 
     cudaEventRecord(sp1_start, STREAM_C);
-    search_pairs<1><<<blocks_sp, threads_sp, 0, STREAM_C>>>
+    pem_spgemm_step2_search_pairs<1><<<blocks_sp, threads_sp, 0, STREAM_C>>>
     (
         d_pairs_a,
         d_pairs_b,
@@ -1133,7 +1180,7 @@ int main(int argc, char *argv[]) {
     dim3 blocks_aC {(_C_nnz+15)/16};
 
     cudaEventRecord(aC_start, STREAM_C);
-    allocate_C_noshmem<<<blocks_aC, threads_aC, 0, STREAM_C>>>
+    pem_spgemm_step2_compute_CMasksAndOffsets<<<blocks_aC, threads_aC, 0, STREAM_C>>>
     (
         d_pairs_a,
         d_pairs_b,
@@ -1159,7 +1206,7 @@ int main(int argc, char *argv[]) {
     dim3 blocks_Cs{(_C_nnz+7)/8};
 
     cudaEventRecord(setOffset_start, STREAM_C);
-    C_setOffsets<<<blocks_Cs, threads_Cs, 0, STREAM_C>>>
+    pem_spgemm_step2_compute_CrowColIdx<<<blocks_Cs, threads_Cs, 0, STREAM_C>>>
     (
         _C_nnz,
         _C_perTileNnz.data().get(),
@@ -1175,7 +1222,7 @@ int main(int argc, char *argv[]) {
     dim3 blocks_mp {(_C_nnz+3)/4};
 
     // cudaEventRecord(accumulator_start, STREAM_C);
-    multiply_pairs_default<ValueType><<<blocks_mp, threads_mp, 0, STREAM_C>>>
+    pem_spgemm_step3_accumulate<ValueType><<<blocks_mp, threads_mp, 0, STREAM_C>>>
     (
         d_pairs_a,
         d_pairs_b,
@@ -1189,8 +1236,8 @@ int main(int argc, char *argv[]) {
         pairs_insertion_offset.data().get()
     );
     cudaEventRecord(accumulator_end, STREAM_C);
-
     cudaDeviceSynchronize();
+    //<<<---------------------------------------------->>>
     auto pem_spgemm_end = std::chrono::high_resolution_clock::now();
     auto pem_spgemm_duration = std::chrono::duration<double, std::milli>(pem_spgemm_end-pem_spgemm_start);
     
@@ -1199,8 +1246,11 @@ int main(int argc, char *argv[]) {
     cudaEventElapsedTime(&Bconversion, B_tileConversion_start, B_tileConversion_end);
 
     float hlm_time, cusparse_time, sp0_time, sp1_time, aC_time, sO_time, accumulator_time;
-    cudaEventElapsedTime(&hlm_time, high_level_multiply_start, high_level_multiply_end);
-    cudaEventElapsedTime(&cusparse_time, cusparse_start, cusparse_end);
+    float hlm_1;//, hlm_2;
+    cudaEventElapsedTime(&hlm_1, high_level_multiply_start, high_level_multiply_end);
+    // cudaEventElapsedTime(&hlm_2, high_level_multiply_start2, high_level_multiply_end2);
+    hlm_time = hlm_1;// + hlm_2;
+    // cudaEventElapsedTime(&cusparse_time, cusparse_start, cusparse_end);
     // cudaEventElapsedTime(&allocate_c_time, allocate_c_start, allocate_c_end);
     cudaEventElapsedTime(&sp0_time, allocate_c_start, sp0_end);
     cudaEventElapsedTime(&sp1_time, sp1_start, sp1_end);
@@ -1215,14 +1265,14 @@ int main(int argc, char *argv[]) {
     float malloc_time = pem_spgemm_time - kernel_time;
     
     std::cout << "<---Program done--->\n";
-    std::cout << "Matrix A CSR to tile conversion took " << Aconversion << "ms\n";
-    std::cout << "Matrix B CSR to tile conversion took " << Bconversion << "ms\n";
-    std::cout << "total--------------------------------" << Aconversion+Bconversion << "ms\n\n";
+    std::cout << "Matrix A CSR to tile conversion took-----" << Aconversion << "ms\n";
+    std::cout << "Matrix B CSR to tile conversion took-----" << Bconversion << "ms\n";
+    std::cout << "total------------------------------------" << Aconversion+Bconversion << "ms\n\n";
 
-    std::cout << "High-Level tile multiplication took--" << hlm_time << "ms\n";
-    std::cout << "*cusparse_hlm took------" << cusparse_time << "ms\n";
-    std::cout << "Allocating C took--------------------" << allocate_c_time << "ms\n";
-    std::cout << "Accumulator took---------------------" << accumulator_time << "ms\n\n";
+    std::cout << "step1 - High Level Multiplication took---" << hlm_time << "ms\n";
+    // std::cout << "*cusparse_hlm took------" << cusparse_time << "ms\n";
+    std::cout << "step2 - Allocating C took----------------" << allocate_c_time << "ms\n";
+    std::cout << "step3 - Accumulation took----------------" << accumulator_time << "ms\n\n";
     
     std::cout << "pemSpGEMM took " << std::fixed << std::setprecision(2) 
     << pem_spgemm_time << "ms\nKernel time " << kernel_time << "ms\nmalloc time " << malloc_time << "ms\n";
