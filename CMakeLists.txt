@@ -6,12 +6,12 @@ project(ta2 LANGUAGES CUDA CXX)
 
 find_package(CUDAToolkit REQUIRED)
 
-set(CMAKE_CUDA_ARCHITECTURES 86)
-set(CMAKE_CUDA_FLAGS_DEBUG "-Xptxas -O0 -g3 -G -Xcompiler -mfma --device-debug --expt-relaxed-constexpr --expt-extended-lambda -march=native")
+# set(CMAKE_CUDA_ARCHITECTURES 86)
+set(CMAKE_CUDA_FLAGS_DEBUG "-Xptxas -O0 -g3 -G -Xcompiler -mfma -gencode=arch=compute_61,code=sm_86 --device-debug --expt-relaxed-constexpr --expt-extended-lambda -march=native")
 set(CMAKE_CXX_FLAGS_DEBUG "-Og -g3")
-set(CMAKE_CUDA_FLAGS_RELEASE "-Xptxas -O3,-v -Xcompiler -mfma -DNDEBUG --expt-relaxed-constexpr --expt-extended-lambda -march=native -O3")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
-set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "-Xptxas -O2,-v -g -DNDEBUG --expt-relaxed-constexpr --expt-extended-lambda -lineinfo")
+set(CMAKE_CUDA_FLAGS_RELEASE "-Xptxas -O3,-v -Xcompiler -mfma -DNDEBUG --expt-relaxed-constexpr --expt-extended-lambda -gencode=arch=compute_61,code=sm_86 -march=native -O3 -DREPEAT=5")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -std=c++20")
+set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "-Xptxas -O2,-v -Xcompiler -mfma -march=native -O2 -g -gencode=arch=compute_61,code=sm_86 -DNDEBUG --expt-relaxed-constexpr --expt-extended-lambda -lineinfo")
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
 set(CMAKE_CUDA_FLAGS_MINSIZEREL "-O1 -DNDEBUG --expt-extended-lambda")
 set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -DNDEBUG")
@@ -26,9 +26,14 @@ add_compile_definitions(THRUST_IGNORE_CUB_VERSION_CHECK)
 # include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/Common)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/ansorge)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/Common)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/ansorge)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/mmio)
+add_library(NSPARSE SHARED ${CMAKE_CURRENT_SOURCE_DIR}/NSPARSE/spgemm_nsparse_kernel.cu)
+target_include_directories(NSPARSE PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/NSPARSE)
 
 
-include("/home/petrus/Sources/CPM.cmake/cmake/CPM.cmake")
+include("./CPM.cmake")
 
 CPMAddPackage(NAME rmm
               GITHUB_REPOSITORY rapidsai/rmm
