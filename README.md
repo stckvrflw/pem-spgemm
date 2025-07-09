@@ -1,23 +1,23 @@
 # pem-spgemm
-#### **RELEASE CANDIDATE**
+#### **BETA**
 Final Assignment Project - SpGEMM algorithm in CUDA
 
 Inspirations from [1]
 
-A Sparse General Matrix-Matrix Multiplication (SpGEMM) implementation.  
-Implemented it my own way from scratch with custom optimization and changes in CUDA C++20.
+An Improved Sparse General Matrix-Matrix Multiplication (SpGEMM) algorithm.  
+Improving upon TileSpGEMM by eliminating atomics and better cache utilization on step 2 and step 3.
 
 Libraries used:
 * [cx.h][ansorge]
 * [thrust][thrust]
 * [rmm][rapidsrmm]
-* [cusparse][cusparse]
 * [fast_matrix_market][fmm]
+* [nsparse][nsparse]
 
 Other resources:
 * Sparse matrices from [suiteSparse][suitesparse]
 
-Papers:
+Reference:
 1. [TileSpGEMM -- **Niu et al.**](https://doi.org/10.1145/3503221.3508431)
 
 
@@ -32,8 +32,9 @@ Environment:
 
 How to use:
 * A^2   : ./spgemm "path-to-.mtx-file" [0/1] 
-* A*At  : ./spgemm "path-to-.mtx-file" [0/1] t  
-*** 0 to skip saving to file, 1 to save to file in /tmp
+* A*At  : ./spgemm "path-to-.mtx-file" [0/1] 1  
+*** 0 to skip saving result (in COO) to file, 1 to save to file in /tmp
+*** no quote on path to mtx-file
 
 [ansorge]: https://github.com/RichardAns/CUDA-Programs
 [thrust]: https://developer.nvidia.com/thrust
@@ -41,3 +42,4 @@ How to use:
 [cusparse]: https://developer.nvidia.com/cusparse
 [fmm]: https://github.com/alugowski/fast_matrix_market
 [suitesparse]: https://sparse.tamu.edu
+[nsparse]: https://github.com/EBD-CREST/nsparse
