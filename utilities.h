@@ -122,10 +122,12 @@ int lowerBound(T const *__restrict__ arr, T target, int len) {
 }
 
 
-template<typename T>
+// template<typename T>
 __host__
 __device__ __forceinline__ 
-int binarySearch(cr_Ptr<T> arr, T target, int len) {
+int binarySearch(cr_Ptr<int> arr, int target, int len) {
+    // auto custom_load = [](uintptr_t global, int &val) __attribute__((always_inline)) { asm ("ld.global.cv.s32 %0, [%1];" : "=r"(val) : "l"(global));};
+    
     if(len == 0) return -1;
     int left = 0;
     int right = len - 1;
@@ -133,9 +135,14 @@ int binarySearch(cr_Ptr<T> arr, T target, int len) {
     while (left <= right) {
         int mid = left + (right - left) / 2;
 
-        if (arr[mid] == target) {
+        // int val;
+        // custom_load((uintptr_t)&arr[mid], val);
+
+        int val = arr[mid];
+
+        if (val == target) {
         return mid;
-        } else if (arr[mid] < target) {
+        } else if (val < target) {
         left = mid + 1;
         } else {
         right = mid - 1;
