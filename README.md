@@ -30,6 +30,11 @@ Environment:
 * driver    : 570.144
 * gcc       : 14.2.1 20241221
 
+How to compile:  
+TODO wrap up the build system;  
+The program works. But dependencies might need to be prepared manually.  
+To reproduce: GPU with sm_86 (edit CMakeFiles.txt)  
+
 How to use:
 * A^2   : ./spgemm "path-to-.mtx-file" [0/1] 
 * A*At  : ./spgemm "path-to-.mtx-file" [0/1] 1  
