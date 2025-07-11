@@ -173,7 +173,7 @@ generate_tiles_csr
 
         __shared__ int temp_buffer[16];
 
-        auto my_row_group = cg::tiled_partition<16>(block); // swap 16 to tileSize
+        auto my_row_group = cg::tiled_partition<tileSize>(block);
         
         int my_row_group_rowPtr_offset = block_tile_offset_y + my_row_group.meta_group_rank();
         if(my_row_group_rowPtr_offset < d_rowPtr_size)
@@ -191,11 +191,8 @@ generate_tiles_csr
         my_row_group.sync();
 
         IdxType my_RowColIdx = (static_cast<IdxType>(my_row_group.meta_group_rank()) << 4) | (thread_J%16);
-        unsigned my_row_nnz = __popc(my_row_group.ballot(thread_J != -1));
-        MaskType my_row_mask = thread_J != -1 ? 1 : 0;
-
-        my_row_mask <<= (thread_J%tileSize);
-        my_row_mask = cg::reduce(my_row_group, my_row_mask, cg::bit_or<decltype(my_row_mask)>());
+        unsigned my_row_mask = my_row_group.ballot(thread_J != -1);
+        unsigned my_row_nnz = __popc(my_row_mask);
 
         if(my_row_group.thread_rank() == 0) {
             d_tiles_masks[(block_d_tiles_offset<<4)+my_row_group.meta_group_rank()] = my_row_mask;
@@ -211,7 +208,7 @@ generate_tiles_csr
 
         int tile_offset = perTileNnz[block_id];
 
-        int my_loc = (thread_val != 0) ? 1 : 0;
+        int my_loc = (thread_J != -1) ? 1 : 0;
         using BlockScan = cub::BlockScan<int, 256>;
         __shared__ typename BlockScan::TempStorage temp_storage;
         BlockScan(temp_storage).ExclusiveSum(my_loc, my_loc);
@@ -241,8 +238,6 @@ __transpose_B_mask
     {
         uint16_t tile_mask[16];
         *(reinterpret_cast<ulonglong4*>(&tile_mask[0])) = *(reinterpret_cast<ulonglong4 const*>(&Btiles_mask[(idx<<4)]));
-        // #pragma unroll
-        // for(int n = 0; n<16; ++n) tile_mask[n] = Btiles_mask[(idx<<4)+n];
         
         #pragma unroll
         for(int m = 0; m < 16; ++m)
@@ -533,9 +528,7 @@ pem_spgemm_step2_compute_CMasksAndOffsets
     while(quarter_group_C_idx < Ctiles_size)
     {
         unsigned quarter_tr_Ctiles_mask = 0;
-        // int const quarter_local_group_pairs_count = __ldcs(&pairs_insertion_offset[quarter_group_C_idx+1])-__ldcs(&pairs_insertion_offset[quarter_group_C_idx]);
 
-        // for(int pair = pairs_insertion_offset[quarter_group_C_idx]; pair < pairs_insertion_offset[quarter_group_C_idx] + quarter_local_group_pairs_count; ++pair)
         for(int pair = __ldcg(&pairs_insertion_offset[quarter_group_C_idx]); pair < __ldcg(&pairs_insertion_offset[quarter_group_C_idx+1]); ++pair)
         {
             int const quarter_local_group_tile_idx_A = __ldcs(&d_pairs_a[pair]);
@@ -759,7 +752,6 @@ int main(int argc, char *argv[])
     unsigned long long flop = 0;
 
     std::jthread read_A(read_matrix_market<ValueType>, std::ref(argv[1]), std::ref(A_I), std::ref(A_J), std::ref(A_val), std::ref(A_rows), std::ref(A_cols), std::ref(A_nnz), std::ref(A_isSymmetric));
-    // read_matrix_market(argv[1], A_I, A_J, A_val, A_rows, A_cols, A_nnz);
     read_matrix_market(argv[1], B_I, B_J, B_val, B_rows, B_cols, B_nnz, B_isSymmetric);
     read_A.join();
 
@@ -1133,16 +1125,13 @@ int main(int argc, char *argv[])
     {
         cudaFree(Ctiles_vals);
         cudaFree(Ctiles_rowColIdx);
-        // rmm::device_vector<int>().swap(_C_perTileNnz);
         cudaFree(_C_perTileNnz);
         cudaFree(Ctiles_mask);
         cudaFree(d_pairs_b);
         cudaFree(d_pairs_a);
-        // rmm::device_vector<int>().swap(pairs_insertion_offset);
         cudaFree(pairs_insertion_offset);
         cudaFree(_C_tileColIdx);
         cudaFree(_C_tileRowIdx);
-        // rmm::device_vector<int>().swap(_C_rowPtr);
         cudaFree(_C_rowPtr);
         cudaFree(Ctiles_rowPtr);
     };
