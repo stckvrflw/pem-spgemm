@@ -1,11 +1,12 @@
 # pem-spgemm
 #### **BETA**
-Final Assignment Project - SpGEMM algorithm in CUDA
-
-Inspirations from [1]
+Final Assignment Project - SpGEMM algorithm in CUDA  
+By Petrus E. Manurung
+2025
 
 An Improved Sparse General Matrix-Matrix Multiplication (SpGEMM) algorithm.  
-Improving upon TileSpGEMM by eliminating atomics and better cache utilization on step 2 and step 3.
+Improving upon TileSpGEMM by eliminating atomics and better cache utilization on step 2 and step 3.  
+Another improvement includes native GPU implementation of conversion from .mtx to Tiled CSR intermediate format. 
 
 Libraries used:
 * [cx.h][ansorge]
@@ -31,15 +32,28 @@ Environment:
 * gcc       : 14.2.1 20241221
 
 How to compile:  
-TODO wrap up the build system;  
-The program works. But dependencies might need to be prepared manually.  
-To reproduce: GPU with sm_86 (edit CMakeFiles.txt)  
+1. mkdir -p pemspgemm/data
+2. cd pemspgemm
+3. clone this repository
+4. get rapidsrmm v24.12.00 from [rapidsrmm] and extract to pem-spgemm (cloned repo)
+5. get fastmatrixmarket v1.7.6 from [fmm] and extract to pem-spgemm (cloned repo)
+6. run "make"
 
 How to use:
-* A^2   : ./spgemm "path-to-.mtx-file" [0/1] 
-* A*At  : ./spgemm "path-to-.mtx-file" [0/1] 1  
-*** 0 to skip saving result (in COO) to file, 1 to save to file in /tmp
-*** no quote on path to mtx-file
+* A^2   : ./pemspgemm "path-to-.mtx-file" [0/1] 
+* A*At  : ./pemspgemm "path-to-.mtx-file" [0/1] 1  
+*** 0 to skip saving result (in COO) to file, 1 to save to /tmp  
+*** since /tmp is in RAM, make sure there is enough space.  
+(e.g. result from A^2 of webbase-1M can cost more than 1.5GiB)  
+*** no quote on path to mtx-file  
+
+To reproduce: GPU with sm_86  
+if using different GPU, change the "code" part in NVCC_FLAGS in the Makefile.  
+Keep "compute_61" unchanged.
+
+Benchmark result is saved in 'data' folder  
+header for the csv:  
+matrix,flop,C_nnz,compression_ratio,step1_time,step2_time,step3_time,pem_spgemm_time,GFlops,A_conversion_kernel_time,tileCSR_conversion_time  
 
 [ansorge]: https://github.com/RichardAns/CUDA-Programs
 [thrust]: https://developer.nvidia.com/thrust
