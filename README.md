@@ -1,7 +1,7 @@
 # pem-spgemm
 #### **BETA**
 Final Assignment Project - SpGEMM algorithm in CUDA  
-By Petrus E. Manurung
+By Petrus E. Manurung  
 2025
 
 An Improved Sparse General Matrix-Matrix Multiplication (SpGEMM) algorithm.  
@@ -9,7 +9,6 @@ Improving upon TileSpGEMM by eliminating atomics and better cache utilization on
 Another improvement includes native GPU implementation of conversion from .mtx to Tiled CSR intermediate format. 
 
 Libraries used:
-* [cx.h][ansorge]
 * [thrust][thrust]
 * [rmm][rapidsrmm]
 * [fast_matrix_market][fmm]

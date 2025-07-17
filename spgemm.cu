@@ -13,11 +13,11 @@ July 2025
 #include <vector>
 #include <complex>
 #include <regex>
+#include <type_traits>
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/scan.h>
 #include <cooperative_groups/reduce.h>
-#include <cooperative_groups/memcpy_async.h>
 
 #include <thrust/sort.h>
 #include <thrust/iterator/zip_iterator.h>
@@ -34,20 +34,32 @@ July 2025
 #include <rmm/exec_policy.hpp>
 #include <rmm/device_vector.hpp>
 
-#include "cx.h"
 #include "fast_matrix_market/fast_matrix_market.hpp"
 #include "utilities.h"
 #include "spgemm_nsparse_kernel.h"
 
 namespace cg = cooperative_groups;
 
+template<typename T>
+struct remove_all_pointers : std::conditional_t<
+    std::is_pointer_v<T>,
+    remove_all_pointers<
+        std::remove_pointer_t<T>
+    >,
+    std::type_identity<T>
+>
+{};
+
+template<typename T>
+using remove_all_pointers_t = typename remove_all_pointers<T>::type;
+
 template<typename ValueType>
 void read_matrix_market
 (
     char const *matrix_path,
-    thrustHvecPin<int> &I, 
-    thrustHvecPin<int> &J, 
-    thrustHvecPin<ValueType> &vals, 
+    int **I, 
+    int **J, 
+    ValueType **vals, 
     int &rows, int &cols, int &nnz,
     bool &isSymmetric
 )
@@ -83,37 +95,40 @@ void read_matrix_market
     _nnz = _vals.size();
     }
     
-    I.reserve(_nnz);
-    J.reserve(_nnz);
-    vals.reserve(_nnz);
+    file.close();
+
+
+    cudaMallocHost(I, sizeof(remove_all_pointers_t<decltype(I)>) * _nnz);
+    cudaMallocHost(J, sizeof(remove_all_pointers_t<decltype(J)>) * _nnz);
+    cudaMallocHost(vals, sizeof(remove_all_pointers_t<decltype(vals)>) * _nnz);
 
     rows = _rows;
     cols = _cols;
     nnz = _nnz;
 
-    I = _I;
-    J = _J;
+    std::copy(_I.begin(), _I.end(), *I);
+    std::copy(_J.begin(), _J.end(), *J);
+
     if(mtx_header.field == fast_matrix_market::field_type::complex)
     {
         int i = 0;
         for(auto cval: _complex_vals)
         {
             ValueType temp = reinterpret_cast<ValueType(&)[2]>(cval)[0]; // get real with complex
-            vals[i++] = temp;
+            (*vals)[i++] = temp;
         }
     }
     else
-    vals = _vals;
-    file.close();
+    std::copy(_vals.begin(), _vals.end(), *vals);
 }
 
 template<unsigned tileSize = 16>
 __global__ void __launch_bounds__(tileSize * tileSize)
 decide_which_tile
 (
-    r_Ptr<long long> participating_tiles,
-    cr_Ptr<int> d_I,
-    cr_Ptr<int> d_J,
+    long long *__restrict__ participating_tiles,
+    int const *__restrict__ d_I,
+    int const *__restrict__ d_J,
     int nnz
 )
 {
@@ -136,16 +151,16 @@ template<typename ValueType, int tileSize = 16>
 __global__ void __launch_bounds__(tileSize * tileSize)
 generate_tiles_csr
 (
-    r_Ptr<ValueType> d_tiles_vals,
-    r_Ptr<uint16_t> d_tiles_masks,
-    r_Ptr<uint8_t> d_tiles_rowPtr,
-    r_Ptr<uint8_t> d_tiles_rowColIdx,
-    cr_Ptr<long long> participating_tiles,
+    ValueType *__restrict__ d_tiles_vals,
+    uint16_t *__restrict__ d_tiles_masks,
+    uint8_t *__restrict__ d_tiles_rowPtr,
+    uint8_t *__restrict__ d_tiles_rowColIdx,
+    long long const *__restrict__ participating_tiles,
     int participating_tiles_size,
-    r_Ptr<int> perTileNnz,
-    cr_Ptr<int> d_J,
-    cr_Ptr<ValueType> d_vals,
-    cr_Ptr<int> d_rowPtr,
+    int *__restrict__ perTileNnz,
+    int const *__restrict__ d_J,
+    ValueType const *__restrict__ d_vals,
+    int const *__restrict__ d_rowPtr,
     int d_rowPtr_size
 )
 {
@@ -223,12 +238,11 @@ generate_tiles_csr
     }
 }
 
-// template<typename ValueType>
 __global__ void __launch_bounds__(256)
 __transpose_B_mask
 (
-    r_Ptr<uint16_t> Btiles_transposed_mask,
-    cr_Ptr<uint16_t> Btiles_mask,
+    uint16_t *__restrict__ Btiles_transposed_mask,
+    uint16_t const *__restrict__ Btiles_mask,
     int Btiles_size
 )
 {
@@ -389,16 +403,16 @@ __device__ __forceinline__
 int __find_pairs
 (
     auto warp,
-    r_Ptr<int> pairs_a,
-    r_Ptr<int> pairs_b,
-    cr_Ptr<int> lane_iter,
+    int *__restrict__ pairs_a,
+    int *__restrict__ pairs_b,
+    int const *__restrict__ lane_iter,
     int lane_iter_len,
-    cr_Ptr<int> lane_targ,
+    int const *__restrict__ lane_targ,
     int const lane_targ_len,
     int const iter_offset,
     int const targ_offset,
     int const AorB,
-    cr_Ptr<int> B_tileOffsets,
+    int const *__restrict__ B_tileOffsets,
     int &insertion_start
 )
 {
@@ -441,18 +455,18 @@ template<int pass>
 __global__ void __launch_bounds__(256) 
 pem_spgemm_step2_search_pairs
 (
-    r_Ptr<int> pairs_a,
-    r_Ptr<int> pairs_b,
-    cr_Ptr<int> C_colIdx,
-    cr_Ptr<int> A_rowPtr,
-    cr_Ptr<int> A_colIdx,
-    cr_Ptr<int> B_colPtr,
-    cr_Ptr<int> B_rowIdx,
+    int *__restrict__ pairs_a,
+    int *__restrict__ pairs_b,
+    int const *__restrict__ C_colIdx,
+    int const *__restrict__ A_rowPtr,
+    int const *__restrict__ A_colIdx,
+    int const *__restrict__ B_colPtr,
+    int const *__restrict__ B_rowIdx,
     int C_rowPtr_size,
     int C_colIdx_size,
-    cr_Ptr<int> B_tileOffsets,
-    cr_Ptr<int> C_rowIdx,
-    r_Ptr<int> pairs_insertion_offset
+    int const *__restrict__ B_tileOffsets,
+    int const *__restrict__ C_rowIdx,
+    int *__restrict__ pairs_insertion_offset
 )
 {
     auto wt_s32 = []<typename T>(uintptr_t global, T &val) __attribute__((always_inline)) { asm volatile("st.global.cs.s32 [%0], %1;" : : "l"(global) , "r"(val)); };
@@ -499,19 +513,19 @@ template<int tileSize = 16>
 __global__ void __launch_bounds__(4 * 32) 
 pem_spgemm_step2_compute_CMasksAndOffsets
 (
-    cr_Ptr<int> d_pairs_a,
-    cr_Ptr<int> d_pairs_b,
+    int const *__restrict__ d_pairs_a,
+    int const *__restrict__ d_pairs_b,
 
     int Ctiles_size,
-    r_Ptr<int> _C_perTileNnz,
+    int *__restrict__ _C_perTileNnz,
 
-    cr_Ptr<uint16_t> Atiles_masks,
-    cr_Ptr<uint16_t> Btiles_masks,
+    uint16_t const *__restrict__ Atiles_masks,
+    uint16_t const *__restrict__ Btiles_masks,
 
-    cr_Ptr<uint16_t> Btiles_transposed_mask,
+    uint16_t const *__restrict__ Btiles_transposed_mask,
 
-    cr_Ptr<int> pairs_insertion_offset,
-    r_Ptr<unsigned> Ctiles_mask
+    int const *__restrict__ pairs_insertion_offset,
+    unsigned *__restrict__ Ctiles_mask
 )
 {
     auto grid = cg::this_grid();
@@ -528,7 +542,6 @@ pem_spgemm_step2_compute_CMasksAndOffsets
     while(quarter_group_C_idx < Ctiles_size)
     {
         unsigned quarter_tr_Ctiles_mask = 0;
-
         for(int pair = __ldcg(&pairs_insertion_offset[quarter_group_C_idx]); pair < __ldcg(&pairs_insertion_offset[quarter_group_C_idx+1]); ++pair)
         {
             int const quarter_local_group_tile_idx_A = __ldcs(&d_pairs_a[pair]);
@@ -558,11 +571,11 @@ __global__ void __launch_bounds__(4 * 32)
 pem_spgemm_step2_compute_CrowColIdx
 (
     int Ctiles_size,
-    r_Ptr<int> _C_perTileNnz,
+    int *__restrict__ _C_perTileNnz,
     
-    r_Ptr<uint8_t> Ctiles_rowColIdx,
-    r_Ptr<uint8_t> Ctiles_rowPtr,
-    cr_Ptr<unsigned> Ctiles_mask
+    uint8_t *__restrict__ Ctiles_rowColIdx,
+    uint8_t *__restrict__ Ctiles_rowPtr,
+    unsigned const *__restrict__ Ctiles_mask
 )
 {
     auto grid = cg::this_grid();
@@ -600,26 +613,26 @@ __global__ void
 __launch_bounds__(tileSize * tileSize / 2)
 pem_spgemm_step3_accumulate
 (
-    cr_Ptr<int> d_pairs_a,
-    cr_Ptr<int> d_pairs_b,
+    int const *__restrict__ d_pairs_a,
+    int const *__restrict__ d_pairs_b,
     
     int Ctiles_size,
-    r_Ptr<ValueType> Ctiles_vals,
-    r_Ptr<int> _C_perTileNnz,
-    cr_Ptr<uint8_t> Ctiles_rowColIdx,
+    ValueType *__restrict__ Ctiles_vals,
+    int *__restrict__ _C_perTileNnz,
+    uint8_t const *__restrict__ Ctiles_rowColIdx,
 
-    cr_Ptr<int> A_perTileNnz,
-    cr_Ptr<ValueType> Atiles_vals,
-    cr_Ptr<uint16_t> Atiles_masks,
-    cr_Ptr<uint8_t> Atiles_rowPtr,
+    int const *__restrict__ A_perTileNnz,
+    ValueType const *__restrict__ Atiles_vals,
+    uint16_t const *__restrict__ Atiles_masks,
+    uint8_t const *__restrict__ Atiles_rowPtr,
 
-    cr_Ptr<int> B_perTileNnz,
-    cr_Ptr<ValueType> Btiles_vals,
-    cr_Ptr<uint16_t> Btiles_masks,
-    cr_Ptr<uint8_t> Btiles_rowPtr,
+    int const *__restrict__ B_perTileNnz,
+    ValueType const *__restrict__ Btiles_vals,
+    uint16_t const *__restrict__ Btiles_masks,
+    uint8_t const *__restrict__ Btiles_rowPtr,
 
-    cr_Ptr<uint16_t> Btiles_transposed_mask,
-    cr_Ptr<int> pairs_insertion_offset
+    uint16_t const *__restrict__ Btiles_transposed_mask,
+    int const *__restrict__ pairs_insertion_offset
 )
 {
     using IdxType = uint8_t;
@@ -673,14 +686,14 @@ template<typename ValueType, int tileSize = 16>
 __global__ void __launch_bounds__(tileSize * tileSize)
 sanitize_C
 (
-    r_Ptr<int> rows, 
-    r_Ptr<int> cols, 
-    cr_Ptr<uint8_t> Ctiles_rowColIdx,
-    cr_Ptr<ValueType> Ctiles_vals,
+    int *__restrict__ rows, 
+    int *__restrict__ cols, 
+    uint8_t const *__restrict__ Ctiles_rowColIdx,
+    ValueType const *__restrict__ Ctiles_vals,
     int Ctiles_size,
-    cr_Ptr<int> _C_tileRowIdx,
-    cr_Ptr<int> _C_tileColIdx, 
-    cr_Ptr<int> _C_perTile_Nnz
+    int const *__restrict__ _C_tileRowIdx,
+    int const *__restrict__ _C_tileColIdx, 
+    int const *__restrict__ _C_perTile_Nnz
 )
 {
     auto warp = cg::tiled_partition<32>(cg::this_thread_block());
@@ -732,27 +745,54 @@ int main(int argc, char *argv[])
     constexpr int tileSize = 16;
     using ValueType = double;
 
+    cudaEvent_t A_tileConversion_start, A_tileConversion_end, B_tileConversion_start, B_tileConversion_end;
+    cudaEvent_t high_level_multiply_start, high_level_multiply_end;
+    cudaEvent_t cusparse_start, cusparse_end;
+    cudaEvent_t allocate_c_start, sp0_end, sp1_start, sp1_end, aC_start, aC_end, setOffset_start, allocate_c_end;
+    cudaEvent_t accumulator_end;
+    cudaEvent_t sanitize_C_start, sanitize_C_end;
+
+    cudaEventCreate(&A_tileConversion_start);
+    cudaEventCreate(&A_tileConversion_end);
+    cudaEventCreate(&B_tileConversion_start);
+    cudaEventCreate(&B_tileConversion_end);
+    cudaEventCreate(&high_level_multiply_start);
+    cudaEventCreate(&high_level_multiply_end);
+    cudaEventCreate(&cusparse_start);
+    cudaEventCreate(&cusparse_end);
+    cudaEventCreate(&allocate_c_start);
+    cudaEventCreate(&sp0_end);
+    cudaEventCreate(&sp1_start);
+    cudaEventCreate(&sp1_end);
+    cudaEventCreate(&aC_start);
+    cudaEventCreate(&aC_end);
+    cudaEventCreate(&setOffset_start);
+    cudaEventCreate(&allocate_c_end);
+    cudaEventCreate(&accumulator_end);
+    cudaEventCreate(&sanitize_C_start);
+    cudaEventCreate(&sanitize_C_end);
+
     std::array<cudaStream_t, STREAMS_COUNT> streams;
     std::for_each(streams.begin(), streams.end(), [](cudaStream_t &s){cudaStreamCreate(&s);});
 
     // HOST MATRIX A ----------------------
-    thrustHvecPin<int> A_I, A_J;
-    thrustHvecPin<ValueType> A_val;
+    int *A_I, *A_J;
+    ValueType *A_val;
     int A_rows, A_cols, A_nnz;
     bool A_isSymmetric = false;
     //-------------------------------------
 
     // HOST MATRIX B ----------------------
-    thrustHvecPin<int> B_I, B_J;
-    thrustHvecPin<ValueType> B_val;
+    int *B_I, *B_J;
+    ValueType *B_val;
     int B_rows, B_cols, B_nnz;
     bool B_isSymmetric = false;
     //-------------------------------------
 
     unsigned long long flop = 0;
 
-    std::jthread read_A(read_matrix_market<ValueType>, std::ref(argv[1]), std::ref(A_I), std::ref(A_J), std::ref(A_val), std::ref(A_rows), std::ref(A_cols), std::ref(A_nnz), std::ref(A_isSymmetric));
-    read_matrix_market(argv[1], B_I, B_J, B_val, B_rows, B_cols, B_nnz, B_isSymmetric);
+    std::jthread read_A(read_matrix_market<ValueType>, std::ref(argv[1]), &A_I, &A_J, &A_val, std::ref(A_rows), std::ref(A_cols), std::ref(A_nnz), std::ref(A_isSymmetric));
+    read_matrix_market(argv[1], &B_I, &B_J, &B_val, B_rows, B_cols, B_nnz, B_isSymmetric);
     read_A.join();
 
     if(A_rows != A_cols && argc < 4)
@@ -792,33 +832,6 @@ int main(int argc, char *argv[])
     auto SPGEMM_TEMPORARY_MR = rmm::mr::cuda_async_memory_resource(sizeof(char) * OVERHEAD);
     auto ASYNC_EXEC_POLICY = [&SPGEMM_TEMPORARY_MR](auto STREAM){return rmm::exec_policy_nosync(STREAM, &SPGEMM_TEMPORARY_MR);};
 
-    cudaEvent_t A_tileConversion_start, A_tileConversion_end, B_tileConversion_start, B_tileConversion_end;
-    cudaEvent_t high_level_multiply_start, high_level_multiply_end;
-    cudaEvent_t cusparse_start, cusparse_end;
-    cudaEvent_t allocate_c_start, sp0_end, sp1_start, sp1_end, aC_start, aC_end, setOffset_start, allocate_c_end;
-    cudaEvent_t accumulator_end;
-    cudaEvent_t sanitize_C_start, sanitize_C_end;
-
-    cudaEventCreate(&A_tileConversion_start);
-    cudaEventCreate(&A_tileConversion_end);
-    cudaEventCreate(&B_tileConversion_start);
-    cudaEventCreate(&B_tileConversion_end);
-    cudaEventCreate(&high_level_multiply_start);
-    cudaEventCreate(&high_level_multiply_end);
-    cudaEventCreate(&cusparse_start);
-    cudaEventCreate(&cusparse_end);
-    cudaEventCreate(&allocate_c_start);
-    cudaEventCreate(&sp0_end);
-    cudaEventCreate(&sp1_start);
-    cudaEventCreate(&sp1_end);
-    cudaEventCreate(&aC_start);
-    cudaEventCreate(&aC_end);
-    cudaEventCreate(&setOffset_start);
-    cudaEventCreate(&allocate_c_end);
-    cudaEventCreate(&accumulator_end);
-    cudaEventCreate(&sanitize_C_start);
-    cudaEventCreate(&sanitize_C_end);
-
 
     // DEVICE MATRIX A --------------------
     rmm::device_vector<int>         A_d_I(A_nnz, SPGEMM_STREAM_ALLOCATOR_INT(STREAM_A));
@@ -832,13 +845,13 @@ int main(int argc, char *argv[])
     rmm::device_vector<ValueType>   B_d_val(B_nnz, SPGEMM_STREAM_ALLOCATOR_VALUETYPE(STREAM_B));
     //-------------------------------------
 
-    thrust::copy(ASYNC_EXEC_POLICY(STREAM_A), A_I.begin(), A_I.end(), A_d_I.begin());
-    thrust::copy(ASYNC_EXEC_POLICY(STREAM_A), A_J.begin(), A_J.end(), A_d_J.begin());
-    thrust::copy(ASYNC_EXEC_POLICY(STREAM_A), A_val.begin(), A_val.end(), A_d_val.begin());
+    thrust::copy(ASYNC_EXEC_POLICY(STREAM_A), A_I, A_I + A_nnz, A_d_I.begin());
+    thrust::copy(ASYNC_EXEC_POLICY(STREAM_A), A_J, A_J + A_nnz, A_d_J.begin());
+    thrust::copy(ASYNC_EXEC_POLICY(STREAM_A), A_val, A_val + A_nnz, A_d_val.begin());
 
-    thrust::copy(ASYNC_EXEC_POLICY(STREAM_B), B_I.begin(), B_I.end(), B_d_I.begin());
-    thrust::copy(ASYNC_EXEC_POLICY(STREAM_B), B_J.begin(), B_J.end(), B_d_J.begin());
-    thrust::copy(ASYNC_EXEC_POLICY(STREAM_B), B_val.begin(), B_val.end(), B_d_val.begin());
+    thrust::copy(ASYNC_EXEC_POLICY(STREAM_B), B_I, B_I + B_nnz, B_d_I.begin());
+    thrust::copy(ASYNC_EXEC_POLICY(STREAM_B), B_J, B_J + B_nnz, B_d_J.begin());
+    thrust::copy(ASYNC_EXEC_POLICY(STREAM_B), B_val, B_val + B_nnz, B_d_val.begin());
 
     cudaDeviceSynchronize();
     auto tileCSR_conversion_start = std::chrono::high_resolution_clock::now();
@@ -1125,13 +1138,16 @@ int main(int argc, char *argv[])
     {
         cudaFree(Ctiles_vals);
         cudaFree(Ctiles_rowColIdx);
+        // rmm::device_vector<int>().swap(_C_perTileNnz);
         cudaFree(_C_perTileNnz);
         cudaFree(Ctiles_mask);
         cudaFree(d_pairs_b);
         cudaFree(d_pairs_a);
+        // rmm::device_vector<int>().swap(pairs_insertion_offset);
         cudaFree(pairs_insertion_offset);
         cudaFree(_C_tileColIdx);
         cudaFree(_C_tileRowIdx);
+        // rmm::device_vector<int>().swap(_C_rowPtr);
         cudaFree(_C_rowPtr);
         cudaFree(Ctiles_rowPtr);
     };
