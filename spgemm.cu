@@ -27,6 +27,7 @@ July 2025
 #include <thrust/partition.h>
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/scatter.h>
+#include <thrust/host_vector.h>
 
 #include <cub/block/block_scan.cuh>
 
@@ -39,19 +40,6 @@ July 2025
 #include "spgemm_nsparse_kernel.h"
 
 namespace cg = cooperative_groups;
-
-template<typename T>
-struct remove_all_pointers : std::conditional_t<
-    std::is_pointer_v<T>,
-    remove_all_pointers<
-        std::remove_pointer_t<T>
-    >,
-    std::type_identity<T>
->
-{};
-
-template<typename T>
-using remove_all_pointers_t = typename remove_all_pointers<T>::type;
 
 template<typename ValueType>
 void read_matrix_market
@@ -402,7 +390,7 @@ __device__ __forceinline__
 // we iterate on lane_iter, search on lane_targ
 int __find_pairs
 (
-    auto warp,
+    auto &warp,
     int *__restrict__ pairs_a,
     int *__restrict__ pairs_b,
     int const *__restrict__ lane_iter,
@@ -515,15 +503,11 @@ pem_spgemm_step2_compute_CMasksAndOffsets
 (
     int const *__restrict__ d_pairs_a,
     int const *__restrict__ d_pairs_b,
-
     int Ctiles_size,
     int *__restrict__ _C_perTileNnz,
-
     uint16_t const *__restrict__ Atiles_masks,
     uint16_t const *__restrict__ Btiles_masks,
-
     uint16_t const *__restrict__ Btiles_transposed_mask,
-
     int const *__restrict__ pairs_insertion_offset,
     unsigned *__restrict__ Ctiles_mask
 )
@@ -572,7 +556,6 @@ pem_spgemm_step2_compute_CrowColIdx
 (
     int Ctiles_size,
     int *__restrict__ _C_perTileNnz,
-    
     uint8_t *__restrict__ Ctiles_rowColIdx,
     uint8_t *__restrict__ Ctiles_rowPtr,
     unsigned const *__restrict__ Ctiles_mask
@@ -615,22 +598,18 @@ pem_spgemm_step3_accumulate
 (
     int const *__restrict__ d_pairs_a,
     int const *__restrict__ d_pairs_b,
-    
     int Ctiles_size,
     ValueType *__restrict__ Ctiles_vals,
     int *__restrict__ _C_perTileNnz,
     uint8_t const *__restrict__ Ctiles_rowColIdx,
-
     int const *__restrict__ A_perTileNnz,
     ValueType const *__restrict__ Atiles_vals,
     uint16_t const *__restrict__ Atiles_masks,
     uint8_t const *__restrict__ Atiles_rowPtr,
-
     int const *__restrict__ B_perTileNnz,
     ValueType const *__restrict__ Btiles_vals,
     uint16_t const *__restrict__ Btiles_masks,
     uint8_t const *__restrict__ Btiles_rowPtr,
-
     uint16_t const *__restrict__ Btiles_transposed_mask,
     int const *__restrict__ pairs_insertion_offset
 )
@@ -738,7 +717,7 @@ enum STREAMS {
 int main(int argc, char *argv[]) 
 {
     if(argc <= 1 || argc > 4) {
-        std::cout << "Provide matrix market file path for A and B (or TRANSPOSE for A * At). Exiting\n";
+        std::cout << "Provide a matrix market file path. Exiting.\n";
         exit(1);
     }
 
@@ -774,6 +753,8 @@ int main(int argc, char *argv[])
 
     std::array<cudaStream_t, STREAMS_COUNT> streams;
     std::for_each(streams.begin(), streams.end(), [](cudaStream_t &s){cudaStreamCreate(&s);});
+
+    auto tileCSR_conversion_start = std::chrono::high_resolution_clock::now();
 
     // HOST MATRIX A ----------------------
     int *A_I, *A_J;
@@ -852,9 +833,6 @@ int main(int argc, char *argv[])
     thrust::copy(ASYNC_EXEC_POLICY(STREAM_B), B_I, B_I + B_nnz, B_d_I.begin());
     thrust::copy(ASYNC_EXEC_POLICY(STREAM_B), B_J, B_J + B_nnz, B_d_J.begin());
     thrust::copy(ASYNC_EXEC_POLICY(STREAM_B), B_val, B_val + B_nnz, B_d_val.begin());
-
-    cudaDeviceSynchronize();
-    auto tileCSR_conversion_start = std::chrono::high_resolution_clock::now();
 
     int A_tileRows = (A_rows-1+tileSize) / tileSize;
     int A_tileCols = (A_cols-1+tileSize) / tileSize;
@@ -1087,7 +1065,7 @@ int main(int argc, char *argv[])
     std::jthread count_flop([=] (unsigned long long *flop)
     {
         cudaStreamSynchronize(STREAM_B);
-        thrustHvec<int> B_rowPtr(B_rows+1);
+        thrust::host_vector<int> B_rowPtr(B_rows+1);
         thrust::copy(B_d_rowPtr.begin(), B_d_rowPtr.end(), B_rowPtr.begin());
 
         for(int i = 0; i < A_nnz; ++i)
@@ -1138,16 +1116,13 @@ int main(int argc, char *argv[])
     {
         cudaFree(Ctiles_vals);
         cudaFree(Ctiles_rowColIdx);
-        // rmm::device_vector<int>().swap(_C_perTileNnz);
         cudaFree(_C_perTileNnz);
         cudaFree(Ctiles_mask);
         cudaFree(d_pairs_b);
         cudaFree(d_pairs_a);
-        // rmm::device_vector<int>().swap(pairs_insertion_offset);
         cudaFree(pairs_insertion_offset);
         cudaFree(_C_tileColIdx);
         cudaFree(_C_tileRowIdx);
-        // rmm::device_vector<int>().swap(_C_rowPtr);
         cudaFree(_C_rowPtr);
         cudaFree(Ctiles_rowPtr);
     };
@@ -1496,6 +1471,7 @@ int main(int argc, char *argv[])
     );
     cudaEventRecord(sanitize_C_end, STREAM_C);
 
+    //temporary
     {
         auto zit = thrust::make_zip_iterator(Crows.begin(), Ccols.begin(), Ctiles_vals);
         thrust::stable_sort(ASYNC_EXEC_POLICY(STREAM_C), zit, zit + C_nnz);
@@ -1517,8 +1493,8 @@ int main(int argc, char *argv[])
 
     auto print = [&outfile] (auto v) { outfile << v << "\n"; };
     
-    thrustHvec<int> hCrows(Crows.size());
-    thrustHvec<int> hCcols(Ccols.size());
+    thrust::host_vector<int> hCrows(Crows.size());
+    thrust::host_vector<int> hCcols(Ccols.size());
     std::vector<ValueType> hCvals(C_nnz);
 
     thrust::copy(Crows.begin(), Crows.end(), hCrows.begin());

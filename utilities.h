@@ -7,8 +7,6 @@ Author: Petrus E. Manurung
 #include <bitset>
 #include <fstream>
 
-#include "TileCSR.h"
-
 #define EXIT_FAILURE 1
 
 #define CHECK_CUSPARSE(func)                                                   \
@@ -61,26 +59,6 @@ Author: Petrus E. Manurung
     } \
   } while (0)
 
-void generate_example_array(r_Ptr<int> data, int m = 16, int n = 16) {
-    int rows[] = {0, 0, 1, 2, 2, 2, 3, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 12, 13, 13, 13, 14, 14, 15};
-    int cols[] = {0, 12, 14, 1, 2, 15, 1, 3, 12, 4, 5, 6, 7, 15, 13, 12, 13, 4, 6, 4, 7, 12, 7, 14, 4};
-    // constexpr int len = std::size(rows);
-    int len = 25;
-    for(int i = 0; i < len; ++i) {
-        data[rows[i] * m + cols[i]] = 1;
-    }
-}
-
-template<typename T>
-void printVector(cr_Ptr<T> data, int rows, int cols) {
-    for(int r = 0; r < rows; ++r) {
-        for(int c = 0; c < cols; ++c) {
-            if constexpr(std::is_integral_v<T>) std::printf("%d ", data[r * cols + c]);
-            else if (std::is_floating_point_v<T>) std::printf("%f ", data[r * cols + c]);
-        }
-        std::printf("\n");
-    }
-}
 
 // template<typename T>
 // __device__ __forceinline__
@@ -124,7 +102,7 @@ int lowerBound(T const *__restrict__ arr, T target, int len) {
 // template<typename T>
 __host__
 __device__ __forceinline__ 
-int binarySearch(cr_Ptr<int> arr, int target, int len) {
+int binarySearch(int const *__restrict__ arr, int target, int len) {
     // auto custom_load = [](uintptr_t global, int &val) __attribute__((always_inline)) { asm ("ld.global.cv.s32 %0, [%1];" : "=r"(val) : "l"(global));};
     
     if(len == 0) return -1;
@@ -150,11 +128,6 @@ int binarySearch(cr_Ptr<int> arr, int target, int len) {
 
     return -1;
 }
-
-template<typename T>
-concept ThrustVector = 
-    std::is_same_v<T, thrust::device_vector<typename T::value_type, typename T::allocator_type>> ||
-    std::is_same_v<T, thrust::host_vector<typename T::value_type, typename T::allocator_type>>;
 
 struct getLow32 : thrust::unary_function<long long,int> {
     __host__ __device__
@@ -185,153 +158,6 @@ struct is_not_neg1 {
     return x != -1;
   }
 };
-
-
-template<typename ValueType, int tileSize>
-void printInfo(std::ofstream &outfile, TileCSR_rev<ValueType,tileSize> const &tile, int tileNnz) noexcept
-{
-    outfile << "TileCSR:\n";
-    outfile << "  mask:\n";
-    for(int i = 0; i < tileSize; ++i) {
-        std::bitset<16> val(tile.mask[i]);
-        outfile << val.to_string().c_str() << "\n";
-        // if((i + 1) % tileSize == 0 && i != tileSize - 1) {
-        //     outfile << "\n";
-        // }
-    }
-    outfile << "\n";
-    outfile << "  rowPtr:\n";
-    for(int i = 0; i < tileSize; ++i) {
-        outfile << static_cast<int>(tile.rowPtr[i]) << " ";
-    }
-    outfile << "\n";
-    outfile << "  rowColIdx:\n";
-    for(int i = 0; i < tileNnz; ++i) {
-        std::bitset<8> val(tile.rowColIdx[i]);
-        outfile << val.to_string().c_str() << " ";
-        if((i + 1) % tileSize == 0 && i != tileNnz - 1) {
-            outfile << "\n";
-        }
-    }
-    outfile << "\n";
-    outfile << "  vals:\n";
-    for(int i = 0; i < tileNnz; ++i) {
-        outfile << tile.vals[i] << " ";
-        if((i + 1) % tileSize == 0 && i != tileNnz - 1) {
-            outfile << "\n";
-        }
-    }
-    outfile << "\n\n";
-}
-
-// template<typename ValueType, int tileSize>
-// void printInfo(
-//     std::ofstream &outfile, TileCSR_rev<ValueType,tileSize> const &tile, int tileNnz) noexcept
-// {
-//     outfile << "TileCSR:\n";
-//     outfile << "  mask:\n";
-//     for(int i = 0; i < tileSize; ++i) {
-//         std::bitset<16> val(tile.mask[i]);
-//         outfile << val.to_string().c_str() << " ";
-//         if((i + 1) % tileSize == 0 && i != tileSize - 1) {
-//             outfile << "\n";
-//         }
-//     }
-//     outfile << "\n";
-//     outfile << "  rowPtr:\n";
-//     for(int i = 0; i < tileSize; ++i) {
-//         outfile << static_cast<int>(tile.rowPtr[i]) << " ";
-//     }
-//     outfile << "\n";
-//     outfile << "  rowColIdx:\n";
-//     for(int i = 0; i < tileNnz; ++i) {
-//         // std::bitset<8> val(tile.rowColIdx[i]);
-//         // outfile << val.to_string().c_str() << " ";
-//         auto val = tile.rowColIdx[i];
-//         auto r = val >> 4;
-//         auto c = val & 0xF;
-//         outfile << r << "-" << c << " ";
-//         if((i + 1) % tileSize == 0 && i != tileNnz - 1) {
-//             outfile << "\n";
-//         }
-//     }
-//     outfile << "\n";
-//     outfile << "  vals:\n";
-//     for(int i = 0; i < tileNnz; ++i) {
-//         outfile << tile.vals[i] << " ";
-//         if((i + 1) % tileSize == 0 && i != tileNnz - 1) {
-//             outfile << "\n";
-//         }
-//     }
-//     outfile << "\n\n";
-// }
-
-template<typename ValueType, int tileSize = 16>
-void printInfo(
-    std::ofstream &outfile, TileCSR_C_rev<ValueType,tileSize> const &tile, double *tileVals, uint8_t *tileRowColIdx, int tileNnz) noexcept
-{
-    outfile << "TileCSR_C_rev:\n";
-    outfile << "  mask:\n";
-    for(int i = 0; i < tileSize/2; ++i) {
-        unsigned masq = tile.mask[i];
-        std::bitset<16> val(masq >> 16);
-        outfile << val.to_string().c_str() << "\n";
-        val = masq;
-        outfile << val.to_string().c_str() << "\n";
-        if((i + 1) % tileSize == 0 && i != tileSize - 1) {
-            outfile << "\n";
-        }
-    }
-    outfile << "\n";
-
-    outfile << "  rowPtr:\n";
-    for(int i = 0; i < tileSize; ++i) {
-        outfile << static_cast<int>(tile.rowPtr[i]) << " ";
-    }
-    outfile << "\n";
-
-    outfile << "  rowColIdx:\n";
-    for(int i = 0; i < tileNnz; ++i) {
-        std::bitset<8> val(tileRowColIdx[i]);
-        outfile << val.to_string().c_str() << " ";
-        if((i + 1) % tileSize == 0 && i != tileNnz - 1) {
-            outfile << "\n";
-        }
-    }
-    outfile << "\n";
-
-    outfile << "  vals:\n";
-    for(int i = 0; i < tileNnz; ++i) {
-        outfile << tileVals[i] << " ";
-        if((i + 1) % tileSize == 0 && i != tileNnz - 1) {
-            outfile << "\n";
-        }
-    }
-    outfile << "\n\n";
-}
-
-template<typename ValueType, int tileSize>
-void printInfo2(std::ofstream &outfile, TileCSR_C_rev<ValueType,tileSize> const &tile, int tileNnz) noexcept
-{
-    outfile << "TileCSR_C:\n";
-    outfile << "  mask:\n";
-    for(int i = 0; i < tileSize; ++i) {
-        std::bitset<16> val(tile.mask[i]);
-        outfile << val.to_string().c_str() << " ";
-        if((i + 1) % tileSize == 0 && i != tileSize - 1) {
-            outfile << "\n";
-        }
-    }
-    outfile << "\n";
-    // outfile << "  vals:\n";
-    // for(int i = 0; i < tileNnz; ++i) {
-    //     outfile << tile.vals[i] << " ";
-    //     if((i + 1) % tileSize == 0 && i != tileNnz - 1) {
-    //         outfile << "\n";
-    //     }
-    // }
-    // outfile << "\n";
-}
 
 template<int tileSize = 16>
 __device__
