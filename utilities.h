@@ -196,3 +196,16 @@ void __tile16x16_transpose_sync(auto &warp, auto *tile)
 
     warp.sync();
 }
+
+template<typename T>
+struct remove_all_pointers : std::conditional_t<
+    std::is_pointer_v<T>,
+    remove_all_pointers<
+        std::remove_pointer_t<T>
+    >,
+    std::type_identity<T>
+>
+{};
+
+template<typename T>
+using remove_all_pointers_t = typename remove_all_pointers<T>::type;
