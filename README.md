@@ -31,12 +31,10 @@ Environment:
 * gcc       : 14.2.1 20241221
 
 How to compile:  
-1. mkdir -p pemspgemm/data
-2. cd pemspgemm
-3. clone this repository
-4. get rapidsrmm v24.12.00 from [rapidsrmm] and extract to pem-spgemm (cloned repo)
-5. get fastmatrixmarket v1.7.6 from [fmm] and extract to pem-spgemm (cloned repo)
-6. run "make"
+1. clone this repository
+2. get rapidsrmm v24.12.00 from [rapidsrmm] and extract to pem-spgemm (cloned repo)
+3. get fastmatrixmarket v1.7.6 from [fmm] and extract to pem-spgemm (cloned repo)
+4. run "make"
 
 How to use:
 * A^2   : ./pemspgemm "path-to-.mtx-file" [0/1] 
@@ -50,7 +48,7 @@ To reproduce: GPU with sm_86
 if using different GPU, change the "code" part in NVCC_FLAGS in the Makefile.  
 Keep "compute_61" unchanged.
 
-Benchmark result is saved in 'data' folder  
+Benchmark result is saved in 'pemspgemm_benchmark_result.csv' file  
 header for the csv:  
 matrix,flop,C_nnz,compression_ratio,step1_time,step2_time,step3_time,pem_spgemm_time,GFlops,A_conversion_kernel_time,tileCSR_conversion_time  
 

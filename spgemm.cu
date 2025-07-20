@@ -1408,7 +1408,7 @@ int main(int argc, char *argv[])
     std::cout << "C nnz: " << C_nnz << "\n";
     std::cout << "Compression ratio " << compression_ratio << "\n";
 
-    char const *csv_filepath = "../data/pemspgemm_benchmark_result.csv";
+    char const *csv_filepath = "./pemspgemm_benchmark_result.csv";
     std::ofstream write_csv;
     write_csv.open(csv_filepath, std::ios::app);
 

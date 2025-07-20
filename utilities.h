@@ -7,7 +7,6 @@ Author: Petrus E. Manurung
 #include <bitset>
 #include <fstream>
 
-#include "cx.h"
 #include "TileCSR.h"
 
 #define EXIT_FAILURE 1
