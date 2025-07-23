@@ -13,7 +13,6 @@ July 2025
 #include <vector>
 #include <complex>
 #include <regex>
-#include <type_traits>
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/scan.h>
@@ -616,7 +615,7 @@ pem_spgemm_step3_accumulate
 {
     using IdxType = uint8_t;
 
-    __shared__ IdxType warp_tileC_rowColIdx[4][256];
+    __shared__ IdxType warp_tileC_rowColIdx[4][tileSize*tileSize];
 
     int const warp_tr = threadIdx.x % 32;
     int const warp_mgr = threadIdx.x >> 5;
@@ -709,6 +708,10 @@ enum STREAMS {
     STREAME,
     STREAMS_COUNT,
 };
+
+#ifndef WARMUP
+#define WARMUP 1
+#endif
 
 #ifndef REPEAT
 #define REPEAT 1
@@ -804,14 +807,14 @@ int main(int argc, char *argv[])
 
     int const OVERHEAD = (A_nnz + B_nnz) / 4;
     auto SPGEMM_MR = rmm::mr::cuda_async_memory_resource(sizeof(ValueType) * 2 * (A_nnz + B_nnz + OVERHEAD));
-    auto SPGEMM_STREAM_ALLOCATOR_INT = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<int>(STREAM, SPGEMM_MR);};
-    auto SPGEMM_STREAM_ALLOCATOR_LONGLONG = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<long long>(STREAM, SPGEMM_MR);};
-    auto SPGEMM_STREAM_ALLOCATOR_VALUETYPE = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<ValueType>(STREAM, SPGEMM_MR);};
-    auto SPGEMM_STREAM_ALLOCATOR_UINT8 = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<uint8_t>(STREAM, SPGEMM_MR);};
-    auto SPGEMM_STREAM_ALLOCATOR_UINT16 = [&SPGEMM_MR](cudaStream_t STREAM) {return rmm::mr::thrust_allocator<uint16_t>(STREAM, SPGEMM_MR);};
+    auto SPGEMM_STREAM_ALLOCATOR_INT = [&SPGEMM_MR](cudaStream_t STREAM) __attribute__((always_inline)) {return rmm::mr::thrust_allocator<int>(STREAM, SPGEMM_MR);};
+    auto SPGEMM_STREAM_ALLOCATOR_LONGLONG = [&SPGEMM_MR](cudaStream_t STREAM) __attribute__((always_inline)) {return rmm::mr::thrust_allocator<long long>(STREAM, SPGEMM_MR);};
+    auto SPGEMM_STREAM_ALLOCATOR_VALUETYPE = [&SPGEMM_MR](cudaStream_t STREAM) __attribute__((always_inline)) {return rmm::mr::thrust_allocator<ValueType>(STREAM, SPGEMM_MR);};
+    auto SPGEMM_STREAM_ALLOCATOR_UINT8 = [&SPGEMM_MR](cudaStream_t STREAM) __attribute__((always_inline)) {return rmm::mr::thrust_allocator<uint8_t>(STREAM, SPGEMM_MR);};
+    auto SPGEMM_STREAM_ALLOCATOR_UINT16 = [&SPGEMM_MR](cudaStream_t STREAM) __attribute__((always_inline)) {return rmm::mr::thrust_allocator<uint16_t>(STREAM, SPGEMM_MR);};
 
     auto SPGEMM_TEMPORARY_MR = rmm::mr::cuda_async_memory_resource(sizeof(char) * OVERHEAD);
-    auto ASYNC_EXEC_POLICY = [&SPGEMM_TEMPORARY_MR](auto STREAM){return rmm::exec_policy_nosync(STREAM, &SPGEMM_TEMPORARY_MR);};
+    auto ASYNC_EXEC_POLICY = [&SPGEMM_TEMPORARY_MR](auto STREAM) __attribute__((always_inline)) {return rmm::exec_policy_nosync(STREAM, &SPGEMM_TEMPORARY_MR);};
 
 
     // DEVICE MATRIX A --------------------
@@ -1093,8 +1096,8 @@ int main(int argc, char *argv[])
 
     //----TIMERS------
     float Aconversion, Bconversion;
-    float hlm_time[REPEAT], sp0_time[REPEAT], sp1_time[REPEAT], aC_time[REPEAT], sO_time[REPEAT], accumulator_time[REPEAT];
-    float allocate_c_time[REPEAT], pem_spgemm_time[REPEAT], kernel_time[REPEAT], malloc_time[REPEAT];
+    float hlm_time[WARMUP+REPEAT+1] = {0.0f}, sp0_time[WARMUP+REPEAT+1] = {0.0f}, sp1_time[WARMUP+REPEAT+1] = {0.0f}, aC_time[WARMUP+REPEAT+1] = {0.0f}, sO_time[WARMUP+REPEAT+1] = {0.0f}, accumulator_time[WARMUP+REPEAT+1] = {0.0f};
+    float allocate_c_time[WARMUP+REPEAT+1] = {0.0f}, pem_spgemm_time[WARMUP+REPEAT+1] = {0.0f}, kernel_time[WARMUP+REPEAT+1] = {0.0f}, malloc_time[WARMUP+REPEAT+1] = {0.0f};
     //----------------
 
     //----BUFFERS-----
@@ -1127,7 +1130,7 @@ int main(int argc, char *argv[])
         cudaFree(Ctiles_rowPtr);
     };
 
-    for(int n = 0; n < REPEAT; ++n)
+    for(int n = 0; n < WARMUP+REPEAT; ++n)
     {
         //<<<-------------------------ALGORITHM------------------------->>>
         auto pem_spgemm_start = std::chrono::high_resolution_clock::now();
@@ -1135,11 +1138,11 @@ int main(int argc, char *argv[])
         cudaMallocAsync(&_C_rowPtr, sizeof(int) * (A_tileRows+1), STREAM_C);
         sfBIN bin;
 
-        cudaDeviceSynchronize();
         auto step1_start = std::chrono::high_resolution_clock::now();
         if(B_tileCols > 512 * 32)
         {
             if(n == 0) printf("\nstep1 using NSPARSE\n");
+            cudaDeviceSynchronize();
             init_bin(&bin, A_tileRows);
             set_max_bin(_A_tileRowPtr.data().get(), _A_tileColIdx.data().get(), _B_tileRowPtr.data().get(), &bin, A_tileRows);
             set_row_nnz(_A_tileRowPtr.data().get(), _A_tileColIdx.data().get(), _B_tileRowPtr.data().get(), _B_tileColIdx.data().get(),
@@ -1350,34 +1353,69 @@ int main(int argc, char *argv[])
         kernel_time[n] = hlm_time[n] + allocate_c_time[n] + accumulator_time[n];
         malloc_time[n] = pem_spgemm_time[n] - kernel_time[n];
 
-        if(n < REPEAT-1) loop_cleanup();
+        if(n < WARMUP+REPEAT-1) loop_cleanup();
     }
 
-    auto fastest = std::min_element(pem_spgemm_time, pem_spgemm_time + REPEAT);
-    int fidx = std::distance(pem_spgemm_time, fastest); 
-    std::cout << "fidx: " << fidx << "\n\n";
+#ifdef FASTEST
+    auto fastest = std::min_element(pem_spgemm_time+WARMUP, pem_spgemm_time+WARMUP+REPEAT);
+    int const idx = std::distance(pem_spgemm_time+WARMUP, fastest); 
+    std::cout << "fidx: " << idx << "\n\n";
+#else
+    int constexpr idx = WARMUP+REPEAT;
+
+    for(int n = WARMUP; n < WARMUP+REPEAT; ++n)
+    {
+    hlm_time[idx] += hlm_time[n];
+    sp0_time[idx] += sp0_time[n];
+    sp1_time[idx] += sp1_time[n];
+    aC_time[idx] += aC_time[n];
+    sO_time[idx] += sO_time[n];
+    accumulator_time[idx] += accumulator_time[n];
+    allocate_c_time[idx] += allocate_c_time[n];
+    pem_spgemm_time[idx] += pem_spgemm_time[n];
+    kernel_time[idx] += kernel_time[n];
+    malloc_time[idx] += malloc_time[n];
+    }
+
+    hlm_time[idx] /= REPEAT;
+    sp0_time[idx] /= REPEAT;
+    sp1_time[idx] /= REPEAT;
+    aC_time[idx] /= REPEAT;
+    sO_time[idx] /= REPEAT;
+    accumulator_time[idx] /= REPEAT;
+    allocate_c_time[idx] /= REPEAT;
+    pem_spgemm_time[idx] /= REPEAT;
+    kernel_time[idx] /= REPEAT;
+    malloc_time[idx] /= REPEAT;
+
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
+#define WARMUP_MSG "warm up " STR(WARMUP) " time"
+#define AVG_MSG "average over " STR(REPEAT) " iterations"
+    std::cout << WARMUP_MSG << "\n" << AVG_MSG << "\n\n";
+#endif
 
     cudaEventElapsedTime(&Aconversion, A_tileConversion_start, A_tileConversion_end);
     cudaEventElapsedTime(&Bconversion, B_tileConversion_start, B_tileConversion_end);
     
     count_flop.join();
     
+    double GFlops = flop*2.0/(pem_spgemm_time[idx] * 1e6);
+    double compression_ratio = static_cast<double>(flop) / C_nnz;
+
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "<---Program done--->\n";
     std::cout << "Matrix A CSR to tile kernel took---------" << Aconversion << "ms\n";
     std::cout << "Matrix B CSR to tile kernel took---------" << Bconversion << "ms\n";
-    std::cout << "total------------------------------------" << tileCSR_conversion_time << "ms\n\n";
+    std::cout << "total conversion overhead----------------" << tileCSR_conversion_time << "ms\n\n";
 
-    std::cout << "step1 - High Level Multiplication took---" << hlm_time[fidx] << "ms\n";
-    std::cout << "step2 - Allocating C took----------------" << allocate_c_time[fidx] << "ms\n";
-    std::cout << "step3 - Accumulation took----------------" << accumulator_time[fidx] << "ms\n\n";
-    
-    double GFlops = flop*2.0/(pem_spgemm_time[fidx] * 1e6);
-    double compression_ratio = static_cast<double>(flop) / C_nnz;
+    std::cout << "step1 - High Level Multiplication took---" << hlm_time[idx] << "ms\n";
+    std::cout << "step2 - Allocating C took----------------" << allocate_c_time[idx] << "ms\n";
+    std::cout << "step3 - Accumulation took----------------" << accumulator_time[idx] << "ms\n\n";
 
     std::cout << "pemSpGEMM took " 
-    << pem_spgemm_time[fidx] << "ms ----- GFlops: " << GFlops 
-    << "\nKernel time " << kernel_time[fidx] << "ms\nmalloc time " << malloc_time[fidx] << "ms\n";
+    << pem_spgemm_time[idx] << "ms ----- GFlops: " << GFlops 
+    << "\nKernel time " << kernel_time[idx] << "ms\nmalloc time " << malloc_time[idx] << "ms\n";
     std::cout << "Flop count: " << flop << "\n\n";
     std::cout << "C tiles: " << _C_nnz << "\n";
     std::cout << "C nnz: " << C_nnz << "\n";
@@ -1398,13 +1436,16 @@ int main(int argc, char *argv[])
     << flop << "," 
     << C_nnz << ","
     << compression_ratio << ","
-    << hlm_time[fidx] << "," 
-    << allocate_c_time[fidx] << "," 
-    << accumulator_time[fidx] << "," 
-    << pem_spgemm_time[fidx] << "," 
-    << GFlops << "," 
     << Aconversion << ","
-    << tileCSR_conversion_time;
+    << Bconversion << ","
+    << tileCSR_conversion_time << ","
+    << hlm_time[idx] << "," 
+    << allocate_c_time[idx] << "," 
+    << accumulator_time[idx] << "," 
+    << pem_spgemm_time[idx] << "," 
+    << kernel_time[idx] << ","
+    << malloc_time[idx] << ","
+    << GFlops;
 
     write_csv.close();
 
@@ -1520,7 +1561,7 @@ int main(int argc, char *argv[])
 
 
     cleanup();
-    std::atexit([]{cudaDeviceReset();});
+    // std::atexit([]{cudaDeviceReset();});
     return 0; // <--------------------------------------------------------------------------------------------------------------------------------
 
     // streams are destroyed by rmm

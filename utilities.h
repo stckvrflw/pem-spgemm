@@ -6,6 +6,7 @@ Author: Petrus E. Manurung
 
 #include <bitset>
 #include <fstream>
+#include <type_traits>
 
 #define EXIT_FAILURE 1
 

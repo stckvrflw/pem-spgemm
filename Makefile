@@ -18,7 +18,6 @@ INCLUDES = -I$(CUDA_INSTALL_PATH)/ncu/host/target-linux-x64/nvtx/include \
  -I$(CUDA_INSTALL_PATH)/include \
  -I$(RMM_PATH)/include \
  -I$(FMM_PATH)/include \
- -I./ansorge \
  -I./Common \
  -I./NSPARSE
  
@@ -32,7 +31,7 @@ DEFINES =  -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE \
 CUDA_LIBS = -L$(CUDA_INSTALL_PATH)/lib64 -lcudart
 LIBS = $(CUDA_LIBS)
 
-OPTS = -DREPEAT=5
+OPTS = -DREPEAT=10
 
 make:
 	$(CC) $(NVCC_FLAGS) $(DEFINES) -Xcompiler -mfma spgemm.cu -o pemspgemm $(INCLUDES) $(LIBS) $(OPTS) 

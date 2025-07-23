@@ -50,7 +50,7 @@ Keep "compute_61" unchanged.
 
 Benchmark result is saved in 'pemspgemm_benchmark_result.csv' file  
 header for the csv:  
-matrix,flop,C_nnz,compression_ratio,step1_time,step2_time,step3_time,pem_spgemm_time,GFlops,A_conversion_kernel_time,tileCSR_conversion_time  
+matrix,flop,C_nnz,compression_ratio,A_conversion_kernel_time,B_conversion_kernel_time,total_conversion_overhead_time,step1_time,step2_time,step3_time,pem_spgemm_time,pem_spgemm_kernel_time,pem_spgemm_malloc_time,Gflops
 
 [ansorge]: https://github.com/RichardAns/CUDA-Programs
 [thrust]: https://developer.nvidia.com/thrust
